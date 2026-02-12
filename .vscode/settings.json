@@ -1,0 +1,6 @@
+{
+    "idf.currentSetup": "C:/Espressif/frameworks/esp-idf-v5.5.2/",
+    "idf.flashType": "UART",
+    "idf.portWin": "COM6",
+    "C_Cpp.default.compilerPath": "C:/Espressif/tools/xtensa-esp32-elf/esp-13.2.0_20240530/xtensa-esp32-elf/bin/xtensa-esp32-elf-gcc.exe"
+}

@@ -1,0 +1,14 @@
+# Sensitive configuration
+main/config.h
+
+# Build files
+build/
+sdkconfig
+sdkconfig.old
+
+# Dependencies
+dependencies/
+managed_components/
+
+# vscode settings
+.vscode/

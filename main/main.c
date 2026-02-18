@@ -305,9 +305,25 @@ void websocket_task(void *arg)
     ESP_LOGI(TAG, "Connecting to WebSocket: %s", WS_URI);
     esp_websocket_client_start(client);
 
-    // Mantém a task rodando
+    // Watchdog: reinicia o ESP32 se ficar desconectado por mais de 5 minutos
+    int disconnected_seconds = 0;
+    const int max_disconnected = 300; // 5 minutos
+
     while (1)
     {
+        if (!esp_websocket_client_is_connected(client))
+        {
+            disconnected_seconds++;
+            if (disconnected_seconds > max_disconnected)
+            {
+                ESP_LOGE(TAG, "WebSocket desconectado por muito tempo. Reiniciando ESP32...");
+                esp_restart();
+            }
+        }
+        else
+        {
+            disconnected_seconds = 0;
+        }
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 }

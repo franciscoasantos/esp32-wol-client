@@ -168,18 +168,10 @@ bool parse_mac_from_json(const char *json, unsigned char *mac)
     const char *mac_field = strstr(json, "\"mac\":");
     if (!mac_field)
     {
-        const char *macaddress_field = strstr(json, "\"macaddress\":");
-        if (!macaddress_field)
-        {
-            ESP_LOGE(TAG, "MAC field not found in JSON");
-            return false;
-        }
-        mac_field = macaddress_field + 14; // strlen("\"macaddress\":")
+        ESP_LOGE(TAG, "MAC field not found in JSON");
+        return false;
     }
-    else
-    {
-        mac_field += 7; // strlen("\"mac\":")
-    }
+    mac_field += 7; // strlen("\"mac\":\")
 
     // Pula espaços e aspas
     while (*mac_field == ' ' || *mac_field == '\"')

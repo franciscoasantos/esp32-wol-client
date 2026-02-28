@@ -25,6 +25,16 @@
 static const char *TAG = "ESP_WOL_WS";
 static led_strip_handle_t led_strip = NULL;
 
+typedef struct
+{
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+} led_color_t;
+
+static led_color_t led_last_applied = {0, 0, 0};
+static bool led_has_last_applied = false;
+
 static bool led_set_color(uint8_t red, uint8_t green, uint8_t blue);
 
 //////////////////////////////////////////////////////////
@@ -44,7 +54,7 @@ static void led_init()
     led_strip_rmt_config_t rmt_config = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .resolution_hz = 10 * 1000 * 1000,
-        .mem_block_symbols = 64,
+        .mem_block_symbols = 128,
         .flags.with_dma = false,
     };
 
@@ -67,6 +77,14 @@ static bool led_set_color(uint8_t red, uint8_t green, uint8_t blue)
         return false;
     }
 
+    if (led_has_last_applied &&
+        led_last_applied.red == red &&
+        led_last_applied.green == green &&
+        led_last_applied.blue == blue)
+    {
+        return true;
+    }
+
     for (int i = 0; i < LED_STRIP_LEDS; i++)
     {
         led_strip_set_pixel(led_strip, i, red, green, blue);
@@ -79,7 +97,11 @@ static bool led_set_color(uint8_t red, uint8_t green, uint8_t blue)
         return false;
     }
 
-    ESP_LOGI(TAG, "LED color set to RGB(%u, %u, %u)", red, green, blue);
+    led_last_applied.red = red;
+    led_last_applied.green = green;
+    led_last_applied.blue = blue;
+    led_has_last_applied = true;
+
     return true;
 }
 
@@ -292,13 +314,23 @@ static bool parse_u8_field(const char *json, const char *field, uint8_t *value)
     while (*pos == ' ' || *pos == '\t')
         pos++;
 
-    int number = -1;
-    if (sscanf(pos, "%d", &number) != 1)
+    if (*pos < '0' || *pos > '9')
     {
         return false;
     }
 
-    if (number < 0 || number > 255)
+    int number = 0;
+    while (*pos >= '0' && *pos <= '9')
+    {
+        number = (number * 10) + (*pos - '0');
+        if (number > 255)
+        {
+            return false;
+        }
+        pos++;
+    }
+
+    if (*pos && *pos != ',' && *pos != '}' && *pos != ' ' && *pos != '\t' && *pos != '\n' && *pos != '\r')
     {
         return false;
     }
@@ -384,8 +416,6 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
     case WEBSOCKET_EVENT_DATA:
         if (data->op_code == 0x01)
         { // Text frame
-            ESP_LOGI(TAG, "Received: %.*s", data->data_len, (char *)data->data_ptr);
-
             // Parse comando do JSON
             unsigned char mac[6];
             uint8_t red = 0, green = 0, blue = 0;
@@ -426,7 +456,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
                         if (led_set_color(red, green, blue))
                         {
                             char response[128];
-                            sprintf(response, "{\"status\":\"ok\",\"action\":\"led\",\"r\":%u,\"g\":%u,\"b\":%u}", red, green, blue);
+                            snprintf(response, sizeof(response), "{\"status\":\"ok\",\"action\":\"led\",\"r\":%u,\"g\":%u,\"b\":%u}", red, green, blue);
                             esp_websocket_client_send_text(data->client, response, strlen(response), portMAX_DELAY);
                         }
                         else
@@ -506,5 +536,5 @@ void app_main()
     led_init();
     wifi_init();
     sync_time();
-    xTaskCreate(websocket_task, "websocket", 12288, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(websocket_task, "websocket", 12288, NULL, 5, NULL, 1);
 }

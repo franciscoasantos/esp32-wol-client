@@ -1,2 +1,15 @@
-idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS ".")
+idf_component_register(SRCS
+                    "main.c"
+                    "net/net_utils.c"
+                    "led/led_controller.c"
+                    "ws/ws_client.c"
+                    "ws/ws_transport.c"
+                    "ws/ws_frame_reassembly.c"
+                    "ws/ws_protocol.c"
+                    "ws/ws_protocol_auth.c"
+                    "ws/ws_protocol_commands.c"
+                    INCLUDE_DIRS
+                    "."
+                    "net"
+                    "led"
+                    "ws")

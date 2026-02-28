@@ -20,14 +20,14 @@ Este projeto permite controlar dispositivos remotamente via Wake-on-LAN e també
 
 ## ✨ Funcionalidades
 
-- ✅ Conexão WebSocket com reconexão automática
-- ✅ Autenticação HMAC-SHA256 com timestamp
-- ✅ Recebimento de MAC address dinâmico via JSON
+- ✅ Conexão WebSocket com reconexão automática e backoff exponencial
+- ✅ Autenticação HMAC-SHA256 com timestamp e MAC do ESP32
+- ✅ Solicitação automática de configuração via `{"action":"get_config"}` após autenticação
+- ✅ Configuração dinâmica da fita LED pelo servidor (`ledPin` e `ledCount`)
 - ✅ Wake-on-LAN via pacote mágico UDP
-- ✅ Controle de cor RGB para fita LED WS2812
-- ✅ Logs detalhados via ESP-IDF
-- ✅ Suporte a múltiplos formatos de MAC address
-- ✅ Confirmação de execução para WoL e LED
+- ✅ Controle de cor RGB global para fita LED WS2812 (`r`, `g`, `b`)
+- ✅ Reassembly de payload WebSocket fragmentado
+- ✅ Tratamento de JSON inválido, `ping/pong` e respostas de erro padronizadas
 
 ## 🛠️ Requisitos
 
@@ -64,10 +64,6 @@ Edite o arquivo [main/config.h](main/config.h) com suas credenciais:
 
 // Security
 #define SECRET "sua-chave-secreta-aleatoria"
-
-// LED Strip (WS2812)
-#define LED_STRIP_GPIO 2
-#define LED_STRIP_LEDS 30
 ```
 
 #### Parâmetros de Configuração
@@ -78,8 +74,8 @@ Edite o arquivo [main/config.h](main/config.h) com suas credenciais:
 | `WIFI_PASS` | Senha da rede WiFi | `"senha123"` |
 | `WS_URI` | URL do servidor WebSocket | `"ws://192.99.145.97:9001"` ou `"wss://seu-dominio.com/ws"` |
 | `SECRET` | Chave secreta para HMAC (16+ caracteres) | `"9f2a1c7e8b4d5f9a"` |
-| `LED_STRIP_GPIO` | GPIO conectado ao DIN da fita LED | `2` |
-| `LED_STRIP_LEDS` | Quantidade de LEDs na fita | `30` |
+
+> **Importante:** `ledPin` e `ledCount` não ficam fixos no firmware. Eles são recebidos do servidor via ação `config` após o `get_config`.
 
 ### 3. Compilar e Flashear
 
@@ -101,7 +97,9 @@ idf.py -p COM3 flash monitor
 O servidor WebSocket deve:
 1. Aceitar conexões WebSocket do ESP32
 2. Validar autenticação HMAC-SHA256
-3. Enviar mensagens JSON de comando WoL ou comando de cor da fita LED
+3. Receber o MAC do ESP32 no payload de autenticação
+4. Responder ao `get_config` com os dados de LED
+5. Enviar mensagens JSON de comando WoL ou comando de cor da fita LED
 
 ### Protocolo de Comunicação
 
@@ -110,11 +108,44 @@ Após conectar, o ESP32 envia:
 ```json
 {
   "token": "esp32-1707825600",
-  "hmac": "a3f2b1e4c5d6..."
+    "hmac": "a3f2b1e4c5d6...",
+    "mac": "AA:BB:CC:DD:EE:FF"
 }
 ```
 
-#### 2. Comando Wake-on-LAN (Servidor → ESP32)
+Em seguida, o ESP32 solicita a configuração dinâmica:
+
+```json
+{
+    "action": "get_config"
+}
+```
+
+#### 2. Configuração dinâmica de LED (Servidor → ESP32)
+Resposta esperada para `get_config`:
+
+```json
+{
+    "action": "config",
+    "status": "ok",
+    "ledCount": 30,
+    "ledPin": 2
+}
+```
+
+Se o servidor ainda não tiver configuração pronta, pode responder:
+
+```json
+{
+    "action": "config",
+    "status": "error",
+    "error": "config_incomplete"
+}
+```
+
+Nesse caso, o cliente força reconexão com backoff e tenta novamente.
+
+#### 3. Comando Wake-on-LAN (Servidor → ESP32)
 O servidor envia mensagens JSON com `action` obrigatório:
 ```json
 {
@@ -128,7 +159,7 @@ Formatos de MAC suportados:
 - `AA-BB-CC-DD-EE-FF` (com hífens)
 - `AABBCCDDEEFF` (sem separadores)
 
-#### 3. Comando LED RGB (Servidor → ESP32)
+#### 4. Comando LED RGB (Servidor → ESP32)
 Também é possível enviar comando para alterar a cor da fita LED.
 
 Formato RGB decimal:
@@ -141,13 +172,13 @@ Formato RGB decimal:
 }
 ```
 
-#### 4. Confirmação (ESP32 → Servidor)
+#### 5. Confirmação (ESP32 → Servidor)
 O ESP32 responde com:
 ```json
 {
   "status": "ok",
     "action": "wol",
-  "mac": "A8:A1:59:98:61:0E"
+    "targetMac": "A8:A1:59:98:61:0E"
 }
 ```
 
@@ -166,119 +197,41 @@ Ou em caso de erro:
 ```json
 {
   "status": "error",
-    "message": "Invalid command"
+    "action": "wol",
+    "message": "Invalid or missing mac"
 }
 ```
 
-### Exemplo de Servidor Node.js
+Outros retornos de erro comuns:
 
-```javascript
-const WebSocket = require('ws');
-const crypto = require('crypto');
-
-const SECRET = '9f2a1c7e8b4d5f9a';
-const PORT = 9001;
-
-const wss = new WebSocket.Server({ port: PORT });
-
-wss.on('connection', (ws) => {
-    console.log('ESP32 connected');
-    let authenticated = false;
-    
-    ws.on('message', (message) => {
-        const data = JSON.parse(message);
-        
-        if (!authenticated) {
-            // Validar HMAC
-            const hmac = crypto.createHmac('sha256', SECRET)
-                .update(data.token)
-                .digest('hex');
-            
-            if (hmac === data.hmac) {
-                console.log('ESP32 authenticated!');
-                authenticated = true;
-                
-                // Exemplo: enviar comando WoL após autenticação
-                // ws.send(JSON.stringify({
-                //     mac: "A8:A1:59:98:61:0E"
-                // }));
-            } else {
-                console.log('Authentication failed');
-                ws.close();
-            }
-        } else {
-            // Processar confirmação do ESP32
-            console.log('Response from ESP32:', data);
-        }
-    });
-    
-    ws.on('close', () => {
-        console.log('ESP32 disconnected');
-    });
-});
-
-console.log(`WebSocket server listening on port ${PORT}`);
+```json
+{"status":"error","message":"Missing action"}
 ```
 
-### Exemplo de Servidor Python
+```json
+{"status":"error","action":"led","error":"invalid_rgb"}
+```
 
-```python
-import asyncio
-import json
-import hashlib
-import hmac
-import websockets
+Para keepalive:
 
-SECRET = '9f2a1c7e8b4d5f9a'
-PORT = 9001
+```json
+{"action":"ping"}
+```
 
-async def handle_client(websocket, path):
-    print("ESP32 connected")
-    authenticated = False
-    
-    async for message in websocket:
-        data = json.loads(message)
-        
-        if not authenticated:
-            # Validar HMAC
-            token = data['token']
-            expected_hmac = hmac.new(
-                SECRET.encode(),
-                token.encode(),
-                hashlib.sha256
-            ).hexdigest()
-            
-            if expected_hmac == data['hmac']:
-                print("ESP32 authenticated!")
-                authenticated = True
-                
-                # Exemplo: enviar comando WoL
-                # await websocket.send(json.dumps({
-                #     "mac": "A8:A1:59:98:61:0E"
-                # }))
-            else:
-                print("Authentication failed")
-                await websocket.close()
-        else:
-            # Processar confirmação do ESP32
-            print(f"Response from ESP32: {data}")
+Resposta:
 
-async def main():
-    async with websockets.serve(handle_client, "0.0.0.0", PORT):
-        print(f"WebSocket server listening on port {PORT}")
-        await asyncio.Future()  # run forever
-
-if __name__ == "__main__":
-    asyncio.run(main())
+```json
+{"status":"ok","action":"pong"}
 ```
 
 ## 📱 Uso
 
 1. Garanta que o servidor WebSocket está rodando
 2. O ESP32 conectará automaticamente ao ligar
-3. Do servidor, envie JSON de Wake-on-LAN (`mac`) ou de LED (`color` ou `r/g/b`)
-4. O ESP32 executará o comando recebido e retornará confirmação
-5. Para WoL, o dispositivo alvo será ligado; para LED, a fita mudará para a cor solicitada
+3. Após autenticar, o ESP32 enviará `{"action":"get_config"}`
+4. O servidor deve responder com `{"action":"config","status":"ok","ledCount":N,"ledPin":P}`
+5. Depois disso, envie JSON de Wake-on-LAN (`"action":"wol"`) ou LED (`"action":"led","r":0,"g":255,"b":128`)
+6. O ESP32 executará o comando recebido e retornará confirmação
 
 ## 🔧 Wake-on-LAN - Configuração do Dispositivo
 
@@ -347,6 +300,7 @@ ifconfig
 ### ESP32 não recebe mensagens do servidor
 - Verificar que a mensagem JSON está corretamente formatada
 - Confirmar que o ESP32 está autenticado antes de enviar comandos
+- Confirmar que a etapa `get_config` foi respondida com `action: "config"` e `status: "ok"`
 - Verificar logs do WebSocket no servidor e no ESP32
 
 ## 📊 Monitoramento
@@ -358,14 +312,13 @@ idf.py monitor
 ```
 
 **Logs importantes:**
-- `Connecting WiFi...` - Conectando ao WiFi
-- `Connecting to WebSocket: ws://...` - Tentando conectar ao servidor WebSocket
 - `WebSocket Connected!` - Conexão WebSocket estabelecida
-- `Auth sent: ...` - Autenticação enviada ao servidor
-- `Received: ...` - Mensagem JSON recebida do servidor
-- `Parsed MAC: ...` - MAC address extraído com sucesso
+- `Auth sent (mac=... token=...)` - Autenticação enviada ao servidor
+- `Requested server config with get_config` - Solicitação de configuração dinâmica
+- `Server config applied successfully (ledCount=... ledPin=...)` - LED configurado via servidor
+- `Command received: ...` - Mensagem JSON recebida do servidor
 - `Wake-on-LAN packet sent (102 bytes)` - Pacote WoL enviado
-- `WebSocket Disconnected` - Reconectando automaticamente
+- `WebSocket Disconnected` - Reconectando automaticamente com backoff
 
 ## 🔒 Segurança
 
@@ -377,7 +330,7 @@ O sistema utiliza autenticação baseada em HMAC-SHA256 com timestamp para garan
 1. **Sincronização de tempo (SNTP):** ESP32 sincroniza relógio com `pool.ntp.org` ao iniciar
 2. **Geração do token:** Cria token único com timestamp atual: `esp32-{timestamp}`
 3. **HMAC:** Gera hash HMAC-SHA256 do token usando `SECRET` compartilhado
-4. **Envio:** Transmite `{"token":"esp32-1234567890","hmac":"abc123..."}`
+4. **Envio:** Transmite `{"token":"esp32-1234567890","hmac":"abc123...","mac":"AA:BB:CC:DD:EE:FF"}`
 5. **Validação no VPS:** Servidor recalcula HMAC e valida timestamp
 
 **Por que SNTP é essencial:**
@@ -385,35 +338,6 @@ O sistema utiliza autenticação baseada em HMAC-SHA256 com timestamp para garan
 - Sem SNTP, timestamps seriam inválidos e rejeitados pelo servidor
 - Sincronização garante que ESP32 e VPS compartilham mesma referência de tempo
 - Previne replay attacks através de validação de janela de tempo
-
-**Exemplo de validação no servidor VPS:**
-
-```javascript
-const crypto = require('crypto');
-
-function validateAuth(auth, secret) {
-    // Recalcula HMAC
-    const hmac = crypto.createHmac('sha256', secret)
-        .update(auth.token)
-        .digest('hex');
-    
-    // Valida HMAC
-    if (hmac !== auth.hmac) {
-        return false; // HMAC inválido
-    }
-    
-    // Extrai timestamp
-    const timestamp = parseInt(auth.token.split('-')[1]);
-    const now = Math.floor(Date.now() / 1000);
-    
-    // Valida janela de tempo (±5 minutos)
-    if (Math.abs(now - timestamp) > 300) {
-        return false; // Timestamp muito antigo/futuro
-    }
-    
-    return true; // Autenticado com sucesso
-}
-```
 
 **Proteções implementadas:**
 - ✅ **Autenticação HMAC-SHA256:** Impede conexões não autorizadas
@@ -435,12 +359,31 @@ function validateAuth(auth, secret) {
 ```
 esp32-wol-client/
 ├── main/
-│   ├── main.c              # Código principal com WebSocket
-│   ├── config.h            # Configurações (WiFi, WS_URI, SECRET)
+│   ├── main.c              # Bootstrap da aplicação
+│   ├── config.h            # Configurações estáticas (WiFi, WS_URI, SECRET)
+│   ├── net/
+│   │   ├── net_utils.h
+│   │   └── net_utils.c     # WiFi, SNTP, HMAC, MAC, WoL
+│   ├── led/
+│   │   ├── led_controller.h
+│   │   └── led_controller.c # Queue/tarefa e aplicação de LED
+│   ├── ws/
+│   │   ├── ws_client.h
+│   │   ├── ws_client.c      # Fachada WS
+│   │   ├── ws_transport.h
+│   │   ├── ws_transport.c   # Conexão, eventos e backoff
+│   │   ├── ws_protocol.h
+│   │   ├── ws_protocol.c
+│   │   ├── ws_protocol_auth.c
+│   │   ├── ws_protocol_commands.c
+│   │   ├── ws_protocol_internal.h
+│   │   ├── ws_frame_reassembly.h
+│   │   └── ws_frame_reassembly.c # Reassembly de frames fragmentados
 │   ├── idf_component.yml   # Dependências do projeto
 │   └── CMakeLists.txt
 ├── managed_components/
-│   └── espressif__esp_websocket_client/  # Componente WebSocket
+│   ├── espressif__esp_websocket_client/
+│   └── espressif__led_strip/
 ├── CMakeLists.txt          # Configuração CMake do projeto
 ├── sdkconfig               # Configuração ESP-IDF
 └── README.md               # Esta documentação

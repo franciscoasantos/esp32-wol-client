@@ -1,18 +1,18 @@
-# ESP32 WoL Client - Wake-on-LAN via WebSocket
+# ESP32 WoL Client - Wake-on-LAN + LED Strip via WebSocket
 
-Sistema de controle remoto Wake-on-LAN baseado em ESP32 com conexão WebSocket para acesso através de servidor VPS.
+Sistema de controle remoto de Wake-on-LAN e fita LED RGB baseado em ESP32 com conexão WebSocket para acesso através de servidor VPS.
 
 ## 📋 Descrição
 
-Este projeto permite controlar dispositivos remotamente via Wake-on-LAN utilizando um ESP32. O ESP32 estabelece uma conexão WebSocket persistente com um servidor VPS, permitindo acesso remoto mesmo quando está atrás de NAT/firewall, sem necessidade de configurar port forwarding no roteador.
+Este projeto permite controlar dispositivos remotamente via Wake-on-LAN e também alterar a cor de uma fita LED RGB (WS2812) utilizando um ESP32. O ESP32 estabelece uma conexão WebSocket persistente com um servidor VPS, permitindo acesso remoto mesmo quando está atrás de NAT/firewall, sem necessidade de configurar port forwarding no roteador.
 
 ### Como Funciona
 
 1. **ESP32** conecta-se à rede WiFi local
 2. Estabelece conexão WebSocket persistente com o **servidor VPS**
-3. Servidor VPS envia mensagens JSON contendo MAC address do dispositivo a ser acordado
-4. ESP32 recebe a mensagem e transmite pacote mágico WoL via broadcast UDP
-5. Dispositivo alvo na rede local é ligado via Wake-on-LAN
+3. Servidor VPS envia mensagens JSON com comando de Wake-on-LAN ou comando de cor RGB
+4. ESP32 processa o comando recebido
+5. Executa Wake-on-LAN na LAN local ou altera a cor da fita LED
 
 ```
 [Internet] ← → [VPS WebSocket] ← → [ESP32] ← → [Dispositivo na LAN]
@@ -24,9 +24,10 @@ Este projeto permite controlar dispositivos remotamente via Wake-on-LAN utilizan
 - ✅ Autenticação HMAC-SHA256 com timestamp
 - ✅ Recebimento de MAC address dinâmico via JSON
 - ✅ Wake-on-LAN via pacote mágico UDP
+- ✅ Controle de cor RGB para fita LED WS2812
 - ✅ Logs detalhados via ESP-IDF
 - ✅ Suporte a múltiplos formatos de MAC address
-- ✅ Confirmação de envio de pacotes WoL
+- ✅ Confirmação de execução para WoL e LED
 
 ## 🛠️ Requisitos
 
@@ -63,6 +64,10 @@ Edite o arquivo [main/config.h](main/config.h) com suas credenciais:
 
 // Security
 #define SECRET "sua-chave-secreta-aleatoria"
+
+// LED Strip (WS2812)
+#define LED_STRIP_GPIO 2
+#define LED_STRIP_LEDS 30
 ```
 
 #### Parâmetros de Configuração
@@ -73,6 +78,8 @@ Edite o arquivo [main/config.h](main/config.h) com suas credenciais:
 | `WIFI_PASS` | Senha da rede WiFi | `"senha123"` |
 | `WS_URI` | URL do servidor WebSocket | `"ws://192.99.145.97:9001"` ou `"wss://seu-dominio.com/ws"` |
 | `SECRET` | Chave secreta para HMAC (16+ caracteres) | `"9f2a1c7e8b4d5f9a"` |
+| `LED_STRIP_GPIO` | GPIO conectado ao DIN da fita LED | `2` |
+| `LED_STRIP_LEDS` | Quantidade de LEDs na fita | `30` |
 
 ### 3. Compilar e Flashear
 
@@ -94,7 +101,7 @@ idf.py -p COM3 flash monitor
 O servidor WebSocket deve:
 1. Aceitar conexões WebSocket do ESP32
 2. Validar autenticação HMAC-SHA256
-3. Enviar mensagens JSON contendo o MAC address do dispositivo a ser acordado
+3. Enviar mensagens JSON de comando WoL ou comando de cor da fita LED
 
 ### Protocolo de Comunicação
 
@@ -108,9 +115,10 @@ Após conectar, o ESP32 envia:
 ```
 
 #### 2. Comando Wake-on-LAN (Servidor → ESP32)
-O servidor envia mensagens JSON com o MAC address:
+O servidor envia mensagens JSON com `action` obrigatório:
 ```json
 {
+  "action": "wol",
   "mac": "A8:A1:59:98:61:0E"
 }
 ```
@@ -120,12 +128,37 @@ Formatos de MAC suportados:
 - `AA-BB-CC-DD-EE-FF` (com hífens)
 - `AABBCCDDEEFF` (sem separadores)
 
-#### 3. Confirmação (ESP32 → Servidor)
+#### 3. Comando LED RGB (Servidor → ESP32)
+Também é possível enviar comando para alterar a cor da fita LED.
+
+Formato RGB decimal:
+```json
+{
+    "action": "led",
+    "r": 0,
+    "g": 255,
+    "b": 128
+}
+```
+
+#### 4. Confirmação (ESP32 → Servidor)
 O ESP32 responde com:
 ```json
 {
   "status": "ok",
+    "action": "wol",
   "mac": "A8:A1:59:98:61:0E"
+}
+```
+
+Para comando LED:
+```json
+{
+    "status": "ok",
+    "action": "led",
+    "r": 0,
+    "g": 255,
+    "b": 128
 }
 ```
 
@@ -133,7 +166,7 @@ Ou em caso de erro:
 ```json
 {
   "status": "error",
-  "message": "Invalid MAC"
+    "message": "Invalid command"
 }
 ```
 
@@ -243,9 +276,9 @@ if __name__ == "__main__":
 
 1. Garanta que o servidor WebSocket está rodando
 2. O ESP32 conectará automaticamente ao ligar
-3. Do servidor, envie mensagens JSON com o MAC address desejado
-4. O ESP32 enviará o pacote Wake-on-LAN
-5. O dispositivo alvo será ligado (se estiver configurado corretamente)
+3. Do servidor, envie JSON de Wake-on-LAN (`mac`) ou de LED (`color` ou `r/g/b`)
+4. O ESP32 executará o comando recebido e retornará confirmação
+5. Para WoL, o dispositivo alvo será ligado; para LED, a fita mudará para a cor solicitada
 
 ## 🔧 Wake-on-LAN - Configuração do Dispositivo
 

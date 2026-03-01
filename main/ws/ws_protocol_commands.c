@@ -10,6 +10,34 @@
 
 static const char *TAG = "ESP_WOL_WSP";
 
+static bool parse_led_type(const cJSON *led_type_json, led_strip_type_t *led_type)
+{
+    if (!led_type)
+    {
+        return false;
+    }
+
+    if (!cJSON_IsString(led_type_json) || !led_type_json->valuestring)
+    {
+        *led_type = LED_STRIP_TYPE_WS2812B;
+        return true;
+    }
+
+    if (strcmp(led_type_json->valuestring, "ws2812b") == 0)
+    {
+        *led_type = LED_STRIP_TYPE_WS2812B;
+        return true;
+    }
+
+    if (strcmp(led_type_json->valuestring, "sk6812") == 0)
+    {
+        *led_type = LED_STRIP_TYPE_SK6812;
+        return true;
+    }
+
+    return false;
+}
+
 static bool handle_wol_command(cJSON *root, esp_websocket_client_handle_t client)
 {
     cJSON *mac_json = cJSON_GetObjectItemCaseSensitive(root, "mac");
@@ -45,6 +73,7 @@ static bool handle_led_command(cJSON *root, esp_websocket_client_handle_t client
     cJSON *r = cJSON_GetObjectItemCaseSensitive(root, "r");
     cJSON *g = cJSON_GetObjectItemCaseSensitive(root, "g");
     cJSON *b = cJSON_GetObjectItemCaseSensitive(root, "b");
+    cJSON *w = cJSON_GetObjectItemCaseSensitive(root, "w");
 
     if (!led_controller_is_configured())
     {
@@ -61,16 +90,34 @@ static bool handle_led_command(cJSON *root, esp_websocket_client_handle_t client
         return false;
     }
 
+    if (w && cJSON_IsNumber(w))
+    {
+        color.white = (uint8_t)w->valueint;
+    }
+    else
+    {
+        color.white = 0;
+    }
+
     if (!led_controller_enqueue(&color, 100))
     {
         ws_protocol_send_error(client, "led", "LED queue busy");
         return false;
     }
 
-    char response[128];
-    snprintf(response, sizeof(response),
-             "{\"status\":\"ok\",\"action\":\"led\",\"r\":%u,\"g\":%u,\"b\":%u}",
-             color.red, color.green, color.blue);
+    char response[160];
+    if (w && cJSON_IsNumber(w))
+    {
+        snprintf(response, sizeof(response),
+                 "{\"status\":\"ok\",\"action\":\"led\",\"r\":%u,\"g\":%u,\"b\":%u,\"w\":%u}",
+                 color.red, color.green, color.blue, color.white);
+    }
+    else
+    {
+        snprintf(response, sizeof(response),
+                 "{\"status\":\"ok\",\"action\":\"led\",\"r\":%u,\"g\":%u,\"b\":%u}",
+                 color.red, color.green, color.blue);
+    }
     ws_protocol_send_json(client, response);
     return true;
 }
@@ -88,6 +135,7 @@ static bool handle_config_message(cJSON *root)
     {
         cJSON *led_count_json = cJSON_GetObjectItemCaseSensitive(root, "ledCount");
         cJSON *led_pin_json = cJSON_GetObjectItemCaseSensitive(root, "ledPin");
+        cJSON *led_type_json = cJSON_GetObjectItemCaseSensitive(root, "ledType");
 
         if (!cJSON_IsNumber(led_count_json) || !cJSON_IsNumber(led_pin_json))
         {
@@ -98,6 +146,7 @@ static bool handle_config_message(cJSON *root)
 
         int led_count = led_count_json->valueint;
         int led_pin = led_pin_json->valueint;
+        led_strip_type_t led_type = LED_STRIP_TYPE_WS2812B;
         if (led_count <= 0 || led_pin < 0)
         {
             ESP_LOGW(TAG, "Config response invalid values (ledCount=%d ledPin=%d)", led_count, led_pin);
@@ -105,14 +154,22 @@ static bool handle_config_message(cJSON *root)
             return false;
         }
 
-        if (!led_controller_configure(led_pin, led_count))
+        if (!parse_led_type(led_type_json, &led_type))
+        {
+            const char *led_type_value = (cJSON_IsString(led_type_json) && led_type_json->valuestring) ? led_type_json->valuestring : "<missing>";
+            ESP_LOGW(TAG, "Config response invalid ledType: %s", led_type_value);
+            ws_protocol_request_force_reconnect();
+            return false;
+        }
+
+        if (!led_controller_configure(led_pin, led_count, led_type))
         {
             ESP_LOGE(TAG, "Failed to apply server LED config");
             ws_protocol_request_force_reconnect();
             return false;
         }
 
-        ESP_LOGI(TAG, "Server config applied successfully (ledCount=%d ledPin=%d)", led_count, led_pin);
+        ESP_LOGI(TAG, "Server config applied successfully (ledCount=%d ledPin=%d ledType=%s)", led_count, led_pin, (led_type == LED_STRIP_TYPE_SK6812) ? "sk6812" : "ws2812b");
         return true;
     }
 

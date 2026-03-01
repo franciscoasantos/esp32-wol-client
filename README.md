@@ -1,10 +1,10 @@
 # ESP32 WoL Client - Wake-on-LAN + LED Strip via WebSocket
 
-Sistema de controle remoto de Wake-on-LAN e fita LED RGB baseado em ESP32 com conexão WebSocket para acesso através de servidor VPS.
+Sistema de controle remoto de Wake-on-LAN e fita LED RGB (WS2812B) ou RGBW (SK6812) baseado em ESP32 com conexão WebSocket para acesso através de servidor VPS.
 
 ## 📋 Descrição
 
-Este projeto permite controlar dispositivos remotamente via Wake-on-LAN e também alterar a cor de uma fita LED RGB (WS2812) utilizando um ESP32. O ESP32 estabelece uma conexão WebSocket persistente com um servidor VPS, permitindo acesso remoto mesmo quando está atrás de NAT/firewall, sem necessidade de configurar port forwarding no roteador.
+Este projeto permite controlar dispositivos remotamente via Wake-on-LAN e também alterar a cor de uma fita LED RGB (WS2812B) ou RGBW (SK6812) utilizando um ESP32. O ESP32 estabelece uma conexão WebSocket persistente com um servidor VPS, permitindo acesso remoto mesmo quando está atrás de NAT/firewall, sem necessidade de configurar port forwarding no roteador.
 
 ### Como Funciona
 
@@ -23,9 +23,10 @@ Este projeto permite controlar dispositivos remotamente via Wake-on-LAN e també
 - ✅ Conexão WebSocket com reconexão automática e backoff exponencial
 - ✅ Autenticação HMAC-SHA256 com timestamp e MAC do ESP32
 - ✅ Solicitação automática de configuração via `{"action":"get_config"}` após autenticação
-- ✅ Configuração dinâmica da fita LED pelo servidor (`ledPin` e `ledCount`)
+- ✅ Configuração dinâmica da fita LED pelo servidor (`ledPin`, `ledCount` e `ledType`)
 - ✅ Wake-on-LAN via pacote mágico UDP
-- ✅ Controle de cor RGB global para fita LED WS2812 (`r`, `g`, `b`)
+- ✅ Controle de cor RGB global para fita LED WS2812B (`r`, `g`, `b`)
+- ✅ Suporte a fita SK6812 RGBW com controle do canal branco (`w`)
 - ✅ Reassembly de payload WebSocket fragmentado
 - ✅ Tratamento de JSON inválido, `ping/pong` e respostas de erro padronizadas
 
@@ -75,7 +76,7 @@ Edite o arquivo [main/config.h](main/config.h) com suas credenciais:
 | `WS_URI` | URL do servidor WebSocket | `"ws://192.99.145.97:9001"` ou `"wss://seu-dominio.com/ws"` |
 | `SECRET` | Chave secreta para HMAC (16+ caracteres) | `"9f2a1c7e8b4d5f9a"` |
 
-> **Importante:** `ledPin` e `ledCount` não ficam fixos no firmware. Eles são recebidos do servidor via ação `config` após o `get_config`.
+> **Importante:** `ledPin`, `ledCount` e `ledType` não ficam fixos no firmware. Eles são recebidos do servidor via ação `config` após o `get_config`.
 
 ### 3. Compilar e Flashear
 
@@ -129,9 +130,14 @@ Resposta esperada para `get_config`:
     "action": "config",
     "status": "ok",
     "ledCount": 30,
-    "ledPin": 2
+    "ledPin": 2,
+    "ledType": "ws2812b" // ou "sk6812"
 }
 ```
+
+Valores aceitos para `ledType`:
+- `ws2812b` (RGB, padrão)
+- `sk6812` (RGBW, ativa canal branco)
 
 Se o servidor ainda não tiver configuração pronta, pode responder:
 
@@ -159,10 +165,10 @@ Formatos de MAC suportados:
 - `AA-BB-CC-DD-EE-FF` (com hífens)
 - `AABBCCDDEEFF` (sem separadores)
 
-#### 4. Comando LED RGB (Servidor → ESP32)
+#### 4. Comando LED RGB/RGBW (Servidor → ESP32)
 Também é possível enviar comando para alterar a cor da fita LED.
 
-Formato RGB decimal:
+Formato RGB (WS2812B ou SK6812 RGB):
 ```json
 {
     "action": "led",
@@ -171,6 +177,18 @@ Formato RGB decimal:
     "b": 128
 }
 ```
+
+Formato RGBW (apenas para SK6812 RGBW):
+```json
+{
+    "action": "led",
+    "r": 0,
+    "g": 255,
+    "b": 128,
+    "w": 64
+}
+```
+O campo `w` (white) é opcional e só tem efeito se a fita for SK6812 RGBW.
 
 #### 5. Confirmação (ESP32 → Servidor)
 O ESP32 responde com:
@@ -184,12 +202,22 @@ O ESP32 responde com:
 
 Para comando LED:
 ```json
+// Para WS2812B ou SK6812 RGB
 {
     "status": "ok",
     "action": "led",
     "r": 0,
     "g": 255,
     "b": 128
+}
+// Para SK6812 RGBW
+{
+    "status": "ok",
+    "action": "led",
+    "r": 0,
+    "g": 255,
+    "b": 128,
+    "w": 64
 }
 ```
 
@@ -229,8 +257,8 @@ Resposta:
 1. Garanta que o servidor WebSocket está rodando
 2. O ESP32 conectará automaticamente ao ligar
 3. Após autenticar, o ESP32 enviará `{"action":"get_config"}`
-4. O servidor deve responder com `{"action":"config","status":"ok","ledCount":N,"ledPin":P}`
-5. Depois disso, envie JSON de Wake-on-LAN (`"action":"wol"`) ou LED (`"action":"led","r":0,"g":255,"b":128`)
+4. O servidor deve responder com `{"action":"config","status":"ok","ledCount":N,"ledPin":P,"ledType":"ws2812b|sk6812"}`
+5. Depois disso, envie JSON de Wake-on-LAN (`"action":"wol"`) ou LED (`"action":"led","r":0,"g":255,"b":128"` ou `"action":"led","r":0,"g":255,"b":128,"w":64"` para SK6812 RGBW)
 6. O ESP32 executará o comando recebido e retornará confirmação
 
 ## 🔧 Wake-on-LAN - Configuração do Dispositivo

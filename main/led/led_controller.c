@@ -9,12 +9,18 @@
 
 static const char *TAG = "ESP_WOL_LED";
 
-static led_strip_handle_t led_strip = NULL;
-static QueueHandle_t led_queue = NULL;
-static int configured_led_count = 0;
-static int configured_led_pin = -1;
-static led_strip_type_t configured_led_type = LED_STRIP_TYPE_WS2812B;
-static bool led_config_ready = false;
+typedef struct
+{
+    led_strip_handle_t strip;
+    QueueHandle_t queue;
+    int count;
+    int pin;
+    led_strip_type_t type;
+    bool config_ready;
+    led_color_t last_color;
+} led_controller_state_t;
+
+static led_controller_state_t led_state = {0};
 
 static led_model_t led_model_from_type(led_strip_type_t led_type)
 {
@@ -42,31 +48,37 @@ static const char *led_type_to_string(led_strip_type_t led_type)
 
 static bool led_apply_color(const led_color_t *color)
 {
-    if (!led_strip)
+    if (!led_state.strip)
     {
         ESP_LOGE(TAG, "LED strip not initialized");
         return false;
     }
 
-    for (int i = 0; i < configured_led_count; i++)
+    if (memcmp(color, &led_state.last_color, sizeof(led_color_t)) == 0)
     {
-        if (configured_led_type == LED_STRIP_TYPE_SK6812)
+        return true;
+    }
+
+    for (int i = 0; i < led_state.count; i++)
+    {
+        if (led_state.type == LED_STRIP_TYPE_SK6812)
         {
-            led_strip_set_pixel_rgbw(led_strip, i, color->red, color->green, color->blue, color->white);
+            led_strip_set_pixel_rgbw(led_state.strip, i, color->red, color->green, color->blue, color->white);
         }
         else
         {
-            led_strip_set_pixel(led_strip, i, color->red, color->green, color->blue);
+            led_strip_set_pixel(led_state.strip, i, color->red, color->green, color->blue);
         }
     }
 
-    esp_err_t err = led_strip_refresh(led_strip);
+    esp_err_t err = led_strip_refresh(led_state.strip);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to refresh LED strip (err=%s)", esp_err_to_name(err));
         return false;
     }
 
+    led_state.last_color = *color;
     return true;
 }
 
@@ -75,7 +87,7 @@ static void led_task(void *arg)
     led_color_t color;
     while (1)
     {
-        if (xQueueReceive(led_queue, &color, portMAX_DELAY) == pdTRUE)
+        if (xQueueReceive(led_state.queue, &color, portMAX_DELAY) == pdTRUE)
         {
             if (!led_apply_color(&color))
             {
@@ -87,10 +99,10 @@ static void led_task(void *arg)
 
 bool led_controller_start(void)
 {
-    if (!led_queue)
+    if (!led_state.queue)
     {
-        led_queue = xQueueCreate(2, sizeof(led_color_t));
-        if (!led_queue)
+        led_state.queue = xQueueCreate(2, sizeof(led_color_t));
+        if (!led_state.queue)
         {
             ESP_LOGE(TAG, "Failed to create LED queue");
             return false;
@@ -110,11 +122,11 @@ bool led_controller_configure(int led_pin, int led_count, led_strip_type_t led_t
         return false;
     }
 
-    if (led_strip)
+    if (led_state.strip)
     {
-        led_strip_clear(led_strip);
-        led_strip_del(led_strip);
-        led_strip = NULL;
+        led_strip_clear(led_state.strip);
+        led_strip_del(led_state.strip);
+        led_state.strip = NULL;
     }
 
     led_color_component_format_t color_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
@@ -138,35 +150,35 @@ bool led_controller_configure(int led_pin, int led_count, led_strip_type_t led_t
         .flags.with_dma = false,
     };
 
-    esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip);
+    esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &led_state.strip);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to init LED strip (err=%s)", esp_err_to_name(err));
-        led_strip = NULL;
-        led_config_ready = false;
+        led_state.strip = NULL;
+        led_state.config_ready = false;
         return false;
     }
 
-    configured_led_pin = led_pin;
-    configured_led_count = led_count;
-    configured_led_type = led_type;
-    led_config_ready = true;
+    led_state.pin = led_pin;
+    led_state.count = led_count;
+    led_state.type = led_type;
+    led_state.config_ready = true;
 
-    ESP_LOGI(TAG, "LED strip initialized from config on GPIO %d with %d LEDs (type=%s)", configured_led_pin, configured_led_count, led_type_to_string(configured_led_type));
+    ESP_LOGI(TAG, "LED strip initialized from config on GPIO %d with %d LEDs (type=%s)", led_state.pin, led_state.count, led_type_to_string(led_state.type));
     return true;
 }
 
 bool led_controller_enqueue(const led_color_t *color, int timeout_ms)
 {
-    if (!led_queue || !color)
+    if (!led_state.queue || !color)
     {
         return false;
     }
 
-    return xQueueSend(led_queue, color, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+    return xQueueSend(led_state.queue, color, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 
 bool led_controller_is_configured(void)
 {
-    return led_config_ready;
+    return led_state.config_ready;
 }

@@ -169,6 +169,26 @@ static bool handle_config_message(cJSON *root)
             return false;
         }
 
+        // Se houver lastLedColor, já define a cor inicial
+        cJSON *last_color_json = cJSON_GetObjectItemCaseSensitive(root, "lastLedColor");
+        if (cJSON_IsObject(last_color_json))
+        {
+            cJSON *r = cJSON_GetObjectItemCaseSensitive(last_color_json, "r");
+            cJSON *g = cJSON_GetObjectItemCaseSensitive(last_color_json, "g");
+            cJSON *b = cJSON_GetObjectItemCaseSensitive(last_color_json, "b");
+            cJSON *w = cJSON_GetObjectItemCaseSensitive(last_color_json, "w");
+            led_color_t color = {0};
+            if (cJSON_IsNumber(r))
+                color.red = (uint8_t)r->valueint;
+            if (cJSON_IsNumber(g))
+                color.green = (uint8_t)g->valueint;
+            if (cJSON_IsNumber(b))
+                color.blue = (uint8_t)b->valueint;
+            if (cJSON_IsNumber(w))
+                color.white = (uint8_t)w->valueint;
+            led_controller_enqueue(&color, 100);
+        }
+
         ESP_LOGI(TAG, "Server config applied successfully (ledCount=%d ledPin=%d ledType=%s)", led_count, led_pin, (led_type == LED_STRIP_TYPE_SK6812) ? "sk6812" : "ws2812b");
         return true;
     }

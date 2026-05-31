@@ -122,7 +122,7 @@ static bool handle_led_command(cJSON *root, esp_websocket_client_handle_t client
     return true;
 }
 
-static bool handle_config_message(cJSON *root)
+static bool handle_config_message(cJSON *root, esp_websocket_client_handle_t client)
 {
     cJSON *status_json = cJSON_GetObjectItemCaseSensitive(root, "status");
     if (!cJSON_IsString(status_json) || status_json->valuestring == NULL)
@@ -190,6 +190,25 @@ static bool handle_config_message(cJSON *root)
         }
 
         ESP_LOGI(TAG, "Server config applied successfully (ledCount=%d ledPin=%d ledType=%s)", led_count, led_pin, (led_type == LED_STRIP_TYPE_SK6812) ? "sk6812" : "ws2812b");
+
+        // Reporta o estado atual da cor para o servidor
+        led_color_t current_color = {0};
+        cJSON *last_color_after = cJSON_GetObjectItemCaseSensitive(root, "lastLedColor");
+        if (cJSON_IsObject(last_color_after))
+        {
+            cJSON *r2 = cJSON_GetObjectItemCaseSensitive(last_color_after, "r");
+            cJSON *g2 = cJSON_GetObjectItemCaseSensitive(last_color_after, "g");
+            cJSON *b2 = cJSON_GetObjectItemCaseSensitive(last_color_after, "b");
+            if (cJSON_IsNumber(r2)) current_color.red   = (uint8_t)r2->valueint;
+            if (cJSON_IsNumber(g2)) current_color.green = (uint8_t)g2->valueint;
+            if (cJSON_IsNumber(b2)) current_color.blue  = (uint8_t)b2->valueint;
+        }
+        char state_report[128];
+        snprintf(state_report, sizeof(state_report),
+                 "{\"action\":\"state_report\",\"r\":%u,\"g\":%u,\"b\":%u,\"w\":%u}",
+                 current_color.red, current_color.green, current_color.blue, current_color.white);
+        ws_protocol_send_json(client, state_report);
+
         return true;
     }
 
@@ -268,7 +287,7 @@ void ws_protocol_handle_complete_text(esp_websocket_client_handle_t client, cons
     }
     else if (strcmp(action, "config") == 0)
     {
-        handle_config_message(root);
+        handle_config_message(root, client);
     }
     else
     {

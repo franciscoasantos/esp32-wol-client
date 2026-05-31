@@ -182,3 +182,8 @@ bool led_controller_is_configured(void)
 {
     return led_state.config_ready;
 }
+
+led_color_t led_controller_get_current_color(void)
+{
+    return led_state.last_color;
+}

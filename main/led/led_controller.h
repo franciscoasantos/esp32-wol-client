@@ -22,5 +22,6 @@ bool led_controller_start(void);
 bool led_controller_configure(int led_pin, int led_count, led_strip_type_t led_type);
 bool led_controller_enqueue(const led_color_t *color, int timeout_ms);
 bool led_controller_is_configured(void);
+led_color_t led_controller_get_current_color(void);
 
 #endif

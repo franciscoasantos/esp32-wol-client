@@ -27,6 +27,7 @@ Este projeto permite controlar dispositivos remotamente via Wake-on-LAN e també
 - ✅ Wake-on-LAN via pacote mágico UDP
 - ✅ Controle de cor RGB global para fita LED WS2812B (`r`, `g`, `b`)
 - ✅ Suporte a fita SK6812 RGBW com controle do canal branco (`w`)
+- ✅ Efeitos animados rodando no próprio firmware (`breathing`, `rainbow`, `fade`) — renderizados de forma não-bloqueante na tarefa de LED, sem depender de fluxo contínuo do servidor
 - ✅ Reassembly de payload WebSocket fragmentado
 - ✅ Tratamento de JSON inválido, `ping/pong` e respostas de erro padronizadas
 
@@ -190,6 +191,21 @@ Formato RGBW (apenas para SK6812 RGBW):
 ```
 O campo `w` (white) é opcional e só tem efeito se a fita for SK6812 RGBW.
 
+#### 4b. Comando de Efeito (Servidor → ESP32)
+Ativa uma animação que roda **no próprio firmware** (o servidor envia apenas um comando):
+```json
+{
+    "action": "effect",
+    "effect": "breathing",
+    "r": 255,
+    "g": 100,
+    "b": 50
+}
+```
+- `effect`: `breathing`, `rainbow`, `fade` ou `none` (para interromper e voltar à última cor sólida)
+- `r`/`g`/`b`: cor base opcional, usada por efeitos como `breathing`
+- A animação é renderizada de forma não-bloqueante na tarefa de LED; receber um comando `led` (cor sólida) também interrompe o efeito
+
 #### 5. Confirmação (ESP32 → Servidor)
 O ESP32 responde com:
 ```json
@@ -218,6 +234,15 @@ Para comando LED:
     "g": 255,
     "b": 128,
     "w": 64
+}
+```
+
+Para comando de efeito:
+```json
+{
+    "status": "ok",
+    "action": "effect",
+    "effect": "breathing"
 }
 ```
 
@@ -258,7 +283,7 @@ Resposta:
 2. O ESP32 conectará automaticamente ao ligar
 3. Após autenticar, o ESP32 enviará `{"action":"get_config"}`
 4. O servidor deve responder com `{"action":"config","status":"ok","ledCount":N,"ledPin":P,"ledType":"ws2812b|sk6812"}`
-5. Depois disso, envie JSON de Wake-on-LAN (`"action":"wol"`) ou LED (`"action":"led","r":0,"g":255,"b":128"` ou `"action":"led","r":0,"g":255,"b":128,"w":64"` para SK6812 RGBW)
+5. Depois disso, envie JSON de Wake-on-LAN (`"action":"wol"`), LED (`"action":"led","r":0,"g":255,"b":128"` ou com `"w":64` para SK6812 RGBW) ou efeito (`"action":"effect","effect":"breathing"`)
 6. O ESP32 executará o comando recebido e retornará confirmação
 
 ## 🔧 Wake-on-LAN - Configuração do Dispositivo
@@ -394,7 +419,7 @@ esp32-wol-client/
 │   │   └── net_utils.c     # WiFi, SNTP, HMAC, MAC, WoL
 │   ├── led/
 │   │   ├── led_controller.h
-│   │   └── led_controller.c # Queue/tarefa e aplicação de LED
+│   │   └── led_controller.c # Queue/tarefa de LED, aplicação de cor e efeitos (breathing/rainbow/fade)
 │   ├── ws/
 │   │   ├── ws_client.h
 │   │   ├── ws_client.c      # Fachada WS
@@ -403,7 +428,7 @@ esp32-wol-client/
 │   │   ├── ws_protocol.h
 │   │   ├── ws_protocol.c
 │   │   ├── ws_protocol_auth.c
-│   │   ├── ws_protocol_commands.c
+│   │   ├── ws_protocol_commands.c # Dispatch de comandos: wol, led, effect, config, ping
 │   │   ├── ws_protocol_internal.h
 │   │   ├── ws_frame_reassembly.h
 │   │   └── ws_frame_reassembly.c # Reassembly de frames fragmentados

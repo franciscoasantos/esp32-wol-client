@@ -122,6 +122,60 @@ static bool handle_led_command(cJSON *root, esp_websocket_client_handle_t client
     return true;
 }
 
+static bool handle_effect_command(cJSON *root, esp_websocket_client_handle_t client)
+{
+    if (!led_controller_is_configured())
+    {
+        ws_protocol_send_error(client, "effect", "LED not configured");
+        return false;
+    }
+
+    cJSON *effect_json = cJSON_GetObjectItemCaseSensitive(root, "effect");
+    const char *effect_name = (cJSON_IsString(effect_json) && effect_json->valuestring != NULL)
+                                  ? effect_json->valuestring
+                                  : "none";
+
+    led_effect_t effect = LED_EFFECT_NONE;
+    if (strcmp(effect_name, "breathing") == 0)
+    {
+        effect = LED_EFFECT_BREATHING;
+    }
+    else if (strcmp(effect_name, "rainbow") == 0)
+    {
+        effect = LED_EFFECT_RAINBOW;
+    }
+    else if (strcmp(effect_name, "fade") == 0)
+    {
+        effect = LED_EFFECT_FADE;
+    }
+    // "none" (ou desconhecido) mantém LED_EFFECT_NONE -> interrompe o efeito
+
+    // Cor base opcional (usada por efeitos como breathing)
+    led_color_t base = {0};
+    led_color_t *base_ptr = NULL;
+    cJSON *r = cJSON_GetObjectItemCaseSensitive(root, "r");
+    cJSON *g = cJSON_GetObjectItemCaseSensitive(root, "g");
+    cJSON *b = cJSON_GetObjectItemCaseSensitive(root, "b");
+    if (ws_protocol_cjson_to_u8(r, &base.red) &&
+        ws_protocol_cjson_to_u8(g, &base.green) &&
+        ws_protocol_cjson_to_u8(b, &base.blue))
+    {
+        base_ptr = &base;
+    }
+
+    if (!led_controller_set_effect(effect, base_ptr, 100))
+    {
+        ws_protocol_send_error(client, "effect", "LED queue busy");
+        return false;
+    }
+
+    char response[96];
+    snprintf(response, sizeof(response),
+             "{\"status\":\"ok\",\"action\":\"effect\",\"effect\":\"%s\"}", effect_name);
+    ws_protocol_send_json(client, response);
+    return true;
+}
+
 static bool handle_config_message(cJSON *root, esp_websocket_client_handle_t client)
 {
     cJSON *status_json = cJSON_GetObjectItemCaseSensitive(root, "status");
@@ -280,6 +334,10 @@ void ws_protocol_handle_complete_text(esp_websocket_client_handle_t client, cons
     else if (strcmp(action, "led") == 0)
     {
         handle_led_command(root, client);
+    }
+    else if (strcmp(action, "effect") == 0)
+    {
+        handle_effect_command(root, client);
     }
     else if (strcmp(action, "ping") == 0)
     {

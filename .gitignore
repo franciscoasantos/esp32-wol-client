@@ -12,3 +12,4 @@ managed_components/
 
 # vscode settings
 .vscode/
+.clangd

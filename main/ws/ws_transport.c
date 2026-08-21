@@ -6,6 +6,7 @@
 
 #include "esp_log.h"
 #include "esp_websocket_client.h"
+#include "esp_crt_bundle.h"
 
 #include "config.h"
 #include "ws_protocol.h"
@@ -84,6 +85,8 @@ static void websocket_task(void *arg)
     esp_websocket_client_config_t ws_cfg = {
         .uri = WS_URI,
         .disable_auto_reconnect = true,
+        // ponytail: bundle de CAs do IDF; ignorado quando a URI e ws://
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
     esp_websocket_client_handle_t client = esp_websocket_client_init(&ws_cfg);

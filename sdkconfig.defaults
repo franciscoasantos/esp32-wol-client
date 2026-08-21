@@ -1,0 +1,4 @@
+# A cadeia TLS da Cloudflare termina em GTS Root R4 cross-signed pela GlobalSign
+# Root CA, que nao esta mais no bundle de CAs do IDF. Sem isto o handshake wss://
+# falha com "No matching trusted root certificate found".
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y

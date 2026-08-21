@@ -14,7 +14,7 @@
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 
-#include "mbedtls/md.h"
+#include "psa/crypto.h"
 
 #include "config.h"
 #include "net_utils.h"
@@ -76,17 +76,29 @@ void sync_time(void)
 
 void make_hmac(const char *token, char *output)
 {
-    unsigned char hmac[32];
+    unsigned char hmac[32] = {0};
+    size_t hmac_len = 0;
 
-    mbedtls_md_context_t ctx;
-    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    // ponytail: PSA e a API publica de HMAC no mbedtls 4 (IDF v6); mbedtls_md_hmac_* virou privada
+    psa_crypto_init();
 
-    mbedtls_md_init(&ctx);
-    mbedtls_md_setup(&ctx, info, 1);
-    mbedtls_md_hmac_starts(&ctx, (unsigned char *)SECRET, strlen(SECRET));
-    mbedtls_md_hmac_update(&ctx, (unsigned char *)token, strlen(token));
-    mbedtls_md_hmac_finish(&ctx, hmac);
-    mbedtls_md_free(&ctx);
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+    psa_set_key_type(&attr, PSA_KEY_TYPE_HMAC);
+
+    psa_key_id_t key = 0;
+    if (psa_import_key(&attr, (const uint8_t *)SECRET, strlen(SECRET), &key) != PSA_SUCCESS ||
+        psa_mac_compute(key, PSA_ALG_HMAC(PSA_ALG_SHA_256),
+                        (const uint8_t *)token, strlen(token),
+                        hmac, sizeof(hmac), &hmac_len) != PSA_SUCCESS)
+    {
+        ESP_LOGE(TAG, "HMAC failed");
+        output[0] = 0;
+        psa_destroy_key(key);
+        return;
+    }
+    psa_destroy_key(key);
 
     for (int i = 0; i < 32; i++)
     {

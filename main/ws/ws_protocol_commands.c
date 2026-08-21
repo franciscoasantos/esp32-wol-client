@@ -122,7 +122,61 @@ static bool handle_led_command(cJSON *root, esp_websocket_client_handle_t client
     return true;
 }
 
-static bool handle_config_message(cJSON *root)
+static bool handle_effect_command(cJSON *root, esp_websocket_client_handle_t client)
+{
+    if (!led_controller_is_configured())
+    {
+        ws_protocol_send_error(client, "effect", "LED not configured");
+        return false;
+    }
+
+    cJSON *effect_json = cJSON_GetObjectItemCaseSensitive(root, "effect");
+    const char *effect_name = (cJSON_IsString(effect_json) && effect_json->valuestring != NULL)
+                                  ? effect_json->valuestring
+                                  : "none";
+
+    led_effect_t effect = LED_EFFECT_NONE;
+    if (strcmp(effect_name, "breathing") == 0)
+    {
+        effect = LED_EFFECT_BREATHING;
+    }
+    else if (strcmp(effect_name, "rainbow") == 0)
+    {
+        effect = LED_EFFECT_RAINBOW;
+    }
+    else if (strcmp(effect_name, "fade") == 0)
+    {
+        effect = LED_EFFECT_FADE;
+    }
+    // "none" (ou desconhecido) mantém LED_EFFECT_NONE -> interrompe o efeito
+
+    // Cor base opcional (usada por efeitos como breathing)
+    led_color_t base = {0};
+    led_color_t *base_ptr = NULL;
+    cJSON *r = cJSON_GetObjectItemCaseSensitive(root, "r");
+    cJSON *g = cJSON_GetObjectItemCaseSensitive(root, "g");
+    cJSON *b = cJSON_GetObjectItemCaseSensitive(root, "b");
+    if (ws_protocol_cjson_to_u8(r, &base.red) &&
+        ws_protocol_cjson_to_u8(g, &base.green) &&
+        ws_protocol_cjson_to_u8(b, &base.blue))
+    {
+        base_ptr = &base;
+    }
+
+    if (!led_controller_set_effect(effect, base_ptr, 100))
+    {
+        ws_protocol_send_error(client, "effect", "LED queue busy");
+        return false;
+    }
+
+    char response[96];
+    snprintf(response, sizeof(response),
+             "{\"status\":\"ok\",\"action\":\"effect\",\"effect\":\"%s\"}", effect_name);
+    ws_protocol_send_json(client, response);
+    return true;
+}
+
+static bool handle_config_message(cJSON *root, esp_websocket_client_handle_t client)
 {
     cJSON *status_json = cJSON_GetObjectItemCaseSensitive(root, "status");
     if (!cJSON_IsString(status_json) || status_json->valuestring == NULL)
@@ -190,6 +244,25 @@ static bool handle_config_message(cJSON *root)
         }
 
         ESP_LOGI(TAG, "Server config applied successfully (ledCount=%d ledPin=%d ledType=%s)", led_count, led_pin, (led_type == LED_STRIP_TYPE_SK6812) ? "sk6812" : "ws2812b");
+
+        // Reporta o estado atual da cor para o servidor
+        led_color_t current_color = {0};
+        cJSON *last_color_after = cJSON_GetObjectItemCaseSensitive(root, "lastLedColor");
+        if (cJSON_IsObject(last_color_after))
+        {
+            cJSON *r2 = cJSON_GetObjectItemCaseSensitive(last_color_after, "r");
+            cJSON *g2 = cJSON_GetObjectItemCaseSensitive(last_color_after, "g");
+            cJSON *b2 = cJSON_GetObjectItemCaseSensitive(last_color_after, "b");
+            if (cJSON_IsNumber(r2)) current_color.red   = (uint8_t)r2->valueint;
+            if (cJSON_IsNumber(g2)) current_color.green = (uint8_t)g2->valueint;
+            if (cJSON_IsNumber(b2)) current_color.blue  = (uint8_t)b2->valueint;
+        }
+        char state_report[128];
+        snprintf(state_report, sizeof(state_report),
+                 "{\"action\":\"state_report\",\"r\":%u,\"g\":%u,\"b\":%u,\"w\":%u}",
+                 current_color.red, current_color.green, current_color.blue, current_color.white);
+        ws_protocol_send_json(client, state_report);
+
         return true;
     }
 
@@ -262,13 +335,17 @@ void ws_protocol_handle_complete_text(esp_websocket_client_handle_t client, cons
     {
         handle_led_command(root, client);
     }
+    else if (strcmp(action, "effect") == 0)
+    {
+        handle_effect_command(root, client);
+    }
     else if (strcmp(action, "ping") == 0)
     {
         ws_protocol_send_json(client, "{\"status\":\"ok\",\"action\":\"pong\"}");
     }
     else if (strcmp(action, "config") == 0)
     {
-        handle_config_message(root);
+        handle_config_message(root, client);
     }
     else
     {

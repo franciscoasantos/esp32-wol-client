@@ -99,7 +99,16 @@ static bool handle_led_command(cJSON *root, esp_websocket_client_handle_t client
         color.white = 0;
     }
 
-    if (!led_controller_enqueue(&color, 100))
+    // fadeMs opcional: 0 (ou ausente) aplica na hora. O seletor de cor manda 0
+    // porque já envia uma cor a cada 140 ms; cenas e rampas mandam algo maior.
+    cJSON *fade_json = cJSON_GetObjectItemCaseSensitive(root, "fadeMs");
+    uint16_t fade_ms = 0;
+    if (cJSON_IsNumber(fade_json) && fade_json->valuedouble > 0)
+    {
+        fade_ms = (fade_json->valuedouble > 60000) ? 60000 : (uint16_t)fade_json->valueint;
+    }
+
+    if (!led_controller_enqueue_fade(&color, fade_ms, 100))
     {
         ws_protocol_send_error(client, "led", "LED queue busy");
         return false;

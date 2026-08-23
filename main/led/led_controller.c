@@ -1,18 +1,24 @@
 #include "led_controller.h"
 
 #include <math.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs.h"
 #include "led_strip.h"
 
 static const char *TAG = "led_controller";
 
 #define LED_QUEUE_LENGTH 8
 #define LED_MIN_FRAME_MS 20   // teto de ~50 fps para fitas curtas
+
+// A cor só vai para a NVS depois de ficar parada por este tempo. Um arraste no
+// seletor manda uma cor a cada 140 ms; sem isso seriam ~7 escritas de flash/s.
+#define LED_SAVE_DEBOUNCE_MS 5000
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -25,6 +31,12 @@ static const char *TAG = "led_controller";
 #define RAINBOW_PERIOD_MS   3000
 #define FADE_PERIOD_MS      6000
 
+#define NVS_NS        "espnest_led"
+#define NVS_KEY_PIN   "pin"
+#define NVS_KEY_COUNT "count"
+#define NVS_KEY_TYPE  "type"
+#define NVS_KEY_COLOR "color"
+
 // Mensagens enviadas para a led_task.
 typedef enum {
     LED_MSG_COLOR = 0,
@@ -35,6 +47,7 @@ typedef struct {
     led_msg_type_t type;
     led_color_t color;      // cor sólida (COLOR) ou cor base do efeito (EFFECT)
     led_effect_t effect;    // usado quando type == LED_MSG_EFFECT
+    uint16_t fade_ms;       // usado quando type == LED_MSG_COLOR (0 = imediato)
 } led_msg_t;
 
 typedef struct {
@@ -103,6 +116,41 @@ static inline void strip_lock(void)
 static inline void strip_unlock(void)
 {
     if (led_state.strip_mutex) xSemaphoreGive(led_state.strip_mutex);
+}
+
+static inline bool color_equals(const led_color_t *a, const led_color_t *b)
+{
+    return a->red == b->red && a->green == b->green && a->blue == b->blue && a->white == b->white;
+}
+
+// ===================== PERSISTÊNCIA (NVS) =====================
+
+static void nvs_save_config(int pin, int count, led_strip_type_t type)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "NVS open failed; config not persisted");
+        return;
+    }
+    nvs_set_i32(h, NVS_KEY_PIN, pin);
+    nvs_set_i32(h, NVS_KEY_COUNT, count);
+    nvs_set_u8(h, NVS_KEY_TYPE, (uint8_t)type);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void nvs_save_color(const led_color_t *color)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "NVS open failed; color not persisted");
+        return;
+    }
+    nvs_set_blob(h, NVS_KEY_COLOR, color, sizeof(*color));
+    nvs_commit(h);
+    nvs_close(h);
 }
 
 // ===================== FUNIL ÚNICO DE SAÍDA =====================
@@ -267,6 +315,27 @@ static void effect_render(led_effect_t effect, const led_color_t *base)
     strip_unlock();
 }
 
+// ===================== TRANSIÇÃO (crossfade) =====================
+
+static inline uint8_t lerp8(uint8_t a, uint8_t b, uint32_t num, uint32_t den)
+{
+    if (den == 0) return b;
+    int32_t delta = (int32_t)b - (int32_t)a;
+    return (uint8_t)((int32_t)a + (delta * (int32_t)num) / (int32_t)den);
+}
+
+// Interpola no espaço bruto (pré-gamma), que é onde as cores são
+// perceptualmente uniformes — o gamma é aplicado depois, no funil de saída.
+static led_color_t color_lerp(led_color_t a, led_color_t b, uint32_t num, uint32_t den)
+{
+    led_color_t c;
+    c.red   = lerp8(a.red,   b.red,   num, den);
+    c.green = lerp8(a.green, b.green, num, den);
+    c.blue  = lerp8(a.blue,  b.blue,  num, den);
+    c.white = lerp8(a.white, b.white, num, den);
+    return c;
+}
+
 // Orçamento de frame: o refresh de uma fita longa domina o tempo de ciclo
 // (589 LEDs RGBW = 589 * 32 bits * 1,25 us ~= 23,6 ms). Pedir mais fps do que
 // a fita comporta só satura o core 1 e faz o RMT (sem DMA no ESP32) disputar
@@ -279,8 +348,9 @@ static uint32_t compute_frame_ms(int count, led_strip_type_t type)
     return (budget_ms < LED_MIN_FRAME_MS) ? LED_MIN_FRAME_MS : budget_ms;
 }
 
-// Toda a animação vive aqui: a task fica bloqueada na fila quando ocioso e,
-// quando um efeito está ativo, acorda mirando um deadline fixo por frame.
+// Toda a animação vive aqui. A task fica bloqueada na fila quando não há nada
+// acontecendo e acorda mirando um deadline — de frame (efeito ou crossfade) ou
+// de gravação na NVS.
 static void led_task(void *arg)
 {
     led_msg_t msg;
@@ -289,20 +359,38 @@ static void led_task(void *arg)
     led_color_t solid = {0, 0, 0, 0};
     int64_t next_frame_us = 0;
 
+    bool fading = false;
+    led_color_t fade_from = {0};
+    led_color_t fade_to = {0};
+    int64_t fade_start_us = 0;
+    uint32_t fade_ms = 0;
+
+    bool save_pending = false;
+    int64_t save_deadline_us = 0;
+    led_color_t saved_color = {0};
+    bool saved_valid = false;
+
     while (1)
     {
+        int64_t now = esp_timer_get_time();
         TickType_t wait;
-        if (active == LED_EFFECT_NONE)
-        {
-            wait = portMAX_DELAY;
-        }
-        else
+
+        if (active != LED_EFFECT_NONE || fading)
         {
             // Arredonda para baixo: acordar um tick cedo e renderizar um pouco
             // antes do deadline é melhor do que passar dele. Como o deadline
             // avança sempre a partir do anterior, não há drift acumulado.
-            int64_t delta_us = next_frame_us - esp_timer_get_time();
+            int64_t delta_us = next_frame_us - now;
             wait = (delta_us <= 0) ? 0 : pdMS_TO_TICKS((uint32_t)(delta_us / 1000));
+        }
+        else if (save_pending)
+        {
+            int64_t delta_us = save_deadline_us - now;
+            wait = (delta_us <= 0) ? 0 : pdMS_TO_TICKS((uint32_t)(delta_us / 1000));
+        }
+        else
+        {
+            wait = portMAX_DELAY;
         }
 
         if (xQueueReceive(led_state.queue, &msg, wait) == pdTRUE)
@@ -311,13 +399,32 @@ static void led_task(void *arg)
             {
                 case LED_MSG_COLOR:
                     active = LED_EFFECT_NONE;
-                    solid = msg.color;
-                    led_apply_color(&msg.color);
+                    if (msg.fade_ms == 0)
+                    {
+                        fading = false;
+                        solid = msg.color;
+                        led_apply_color(&solid);
+                    }
+                    else
+                    {
+                        // A transição sempre parte da última cor sólida. Se um
+                        // efeito estava rodando, o que está na fita é o frame
+                        // do efeito, então há um salto antes do fade.
+                        fade_from = solid;
+                        fade_to = msg.color;
+                        fade_ms = msg.fade_ms;
+                        fade_start_us = esp_timer_get_time();
+                        next_frame_us = fade_start_us;
+                        fading = true;
+                    }
+                    save_pending = true;
+                    save_deadline_us = esp_timer_get_time() + (int64_t)LED_SAVE_DEBOUNCE_MS * 1000;
                     break;
 
                 case LED_MSG_EFFECT:
                     active = msg.effect;
                     base = msg.color;
+                    fading = false;
                     next_frame_us = esp_timer_get_time();
                     if (active == LED_EFFECT_NONE)
                     {
@@ -325,18 +432,53 @@ static void led_task(void *arg)
                     }
                     break;
             }
+            continue;
+        }
+
+        // Nada na fila: o que venceu foi um deadline.
+        now = esp_timer_get_time();
+
+        if (fading)
+        {
+            uint32_t elapsed = (uint32_t)((now - fade_start_us) / 1000);
+            if (elapsed >= fade_ms)
+            {
+                fading = false;
+                solid = fade_to;
+                led_apply_color(&solid);
+            }
+            else
+            {
+                led_color_t step = color_lerp(fade_from, fade_to, elapsed, fade_ms);
+                led_apply_color(&step);
+                next_frame_us += (int64_t)led_state.frame_ms * 1000;
+                if (next_frame_us < now)
+                {
+                    next_frame_us = now + (int64_t)led_state.frame_ms * 1000;
+                }
+            }
         }
         else if (active != LED_EFFECT_NONE)
         {
-            // deadline atingido -> próximo frame do efeito
             effect_render(active, &base);
 
-            int64_t now = esp_timer_get_time();
             next_frame_us += (int64_t)led_state.frame_ms * 1000;
             if (next_frame_us < now)
             {
                 // renderização atrasou; não tenta recuperar frames perdidos
                 next_frame_us = now + (int64_t)led_state.frame_ms * 1000;
+            }
+        }
+        else if (save_pending)
+        {
+            save_pending = false;
+            if (!saved_valid || !color_equals(&saved_color, &solid))
+            {
+                nvs_save_color(&solid);
+                saved_color = solid;
+                saved_valid = true;
+                ESP_LOGI(TAG, "Color persisted to NVS (r=%u g=%u b=%u w=%u)",
+                         solid.red, solid.green, solid.blue, solid.white);
             }
         }
     }
@@ -383,7 +525,7 @@ bool led_controller_start(void)
     return true;
 }
 
-bool led_controller_configure(int led_pin, int led_count, led_strip_type_t led_type)
+static bool configure_internal(int led_pin, int led_count, led_strip_type_t led_type, bool persist)
 {
     if (led_pin < 0 || led_count <= 0)
     {
@@ -453,6 +595,11 @@ bool led_controller_configure(int led_pin, int led_count, led_strip_type_t led_t
     led_state.config_ready = true;
     strip_unlock();
 
+    if (persist)
+    {
+        nvs_save_config(led_pin, led_count, led_type);
+    }
+
     ESP_LOGI(TAG, "LED strip configured: pin=%d, count=%d, type=%s, frame=%ums (~%u fps)",
              led_pin, led_count,
              (led_type == LED_STRIP_TYPE_SK6812) ? "sk6812" : "ws2812b",
@@ -465,14 +612,78 @@ bool led_controller_configure(int led_pin, int led_count, led_strip_type_t led_t
     return true;
 }
 
+bool led_controller_configure(int led_pin, int led_count, led_strip_type_t led_type)
+{
+    return configure_internal(led_pin, led_count, led_type, true);
+}
+
+bool led_controller_restore(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK)
+    {
+        return false; // primeira execução: ainda não há nada gravado
+    }
+
+    int32_t pin = -1;
+    int32_t count = 0;
+    uint8_t type = LED_STRIP_TYPE_WS2812B;
+    esp_err_t pin_err = nvs_get_i32(h, NVS_KEY_PIN, &pin);
+    esp_err_t count_err = nvs_get_i32(h, NVS_KEY_COUNT, &count);
+    nvs_get_u8(h, NVS_KEY_TYPE, &type);
+
+    led_color_t color = {0};
+    size_t color_len = sizeof(color);
+    bool has_color = (nvs_get_blob(h, NVS_KEY_COLOR, &color, &color_len) == ESP_OK &&
+                      color_len == sizeof(color));
+    nvs_close(h);
+
+    if (pin_err != ESP_OK || count_err != ESP_OK || pin < 0 || count <= 0)
+    {
+        return false;
+    }
+
+    if (type != LED_STRIP_TYPE_SK6812)
+    {
+        type = LED_STRIP_TYPE_WS2812B;
+    }
+
+    // persist = false: acabou de vir da NVS, não faz sentido regravar.
+    if (!configure_internal((int)pin, (int)count, (led_strip_type_t)type, false))
+    {
+        return false;
+    }
+
+    if (has_color)
+    {
+        led_controller_enqueue(&color, 100);
+    }
+
+    ESP_LOGI(TAG, "Restored from NVS: pin=%d count=%d type=%s color=%s",
+             (int)pin, (int)count,
+             (type == LED_STRIP_TYPE_SK6812) ? "sk6812" : "ws2812b",
+             has_color ? "yes" : "no");
+    return true;
+}
+
 bool led_controller_enqueue(const led_color_t *color, int timeout_ms)
+{
+    return led_controller_enqueue_fade(color, 0, timeout_ms);
+}
+
+bool led_controller_enqueue_fade(const led_color_t *color, uint16_t fade_ms, int timeout_ms)
 {
     if (led_state.queue == NULL || color == NULL)
     {
         return false;
     }
 
-    led_msg_t msg = { .type = LED_MSG_COLOR, .color = *color, .effect = LED_EFFECT_NONE };
+    led_msg_t msg = {
+        .type = LED_MSG_COLOR,
+        .color = *color,
+        .effect = LED_EFFECT_NONE,
+        .fade_ms = fade_ms
+    };
     if (xQueueSend(led_state.queue, &msg, pdMS_TO_TICKS(timeout_ms)) != pdTRUE)
     {
         return false;
@@ -488,7 +699,12 @@ bool led_controller_set_effect(led_effect_t effect, const led_color_t *base_colo
         return false;
     }
 
-    led_msg_t msg = { .type = LED_MSG_EFFECT, .effect = effect, .color = {255, 255, 255, 0} };
+    led_msg_t msg = {
+        .type = LED_MSG_EFFECT,
+        .color = {255, 255, 255, 0},
+        .effect = effect,
+        .fade_ms = 0
+    };
     if (base_color != NULL)
     {
         msg.color = *base_color;

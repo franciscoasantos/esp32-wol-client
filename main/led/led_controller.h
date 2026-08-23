@@ -29,7 +29,13 @@ typedef enum
 
 bool led_controller_start(void);
 bool led_controller_configure(int led_pin, int led_count, led_strip_type_t led_type);
+// Reaplica a última configuração e cor salvas na NVS. Feito antes da rede para
+// a fita acender no boot sem esperar WiFi + TLS + get_config.
+bool led_controller_restore(void);
 bool led_controller_enqueue(const led_color_t *color, int timeout_ms);
+// Igual ao enqueue, mas interpolando da cor sólida atual até `color` ao longo
+// de fade_ms. fade_ms = 0 aplica na hora.
+bool led_controller_enqueue_fade(const led_color_t *color, uint16_t fade_ms, int timeout_ms);
 // Inicia/troca o efeito. base_color é a cor de referência (ex.: breathing).
 // LED_EFFECT_NONE interrompe o efeito e restaura a última cor sólida.
 bool led_controller_set_effect(led_effect_t effect, const led_color_t *base_color, int timeout_ms);

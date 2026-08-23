@@ -4,19 +4,28 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "led_strip.h"
 
 static const char *TAG = "led_controller";
 
 #define LED_QUEUE_LENGTH 8
-#define EFFECT_FRAME_MS 20   // ~50 fps
+#define LED_MIN_FRAME_MS 20   // teto de ~50 fps para fitas curtas
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-// Mensagens enviadas para a led_task: ou uma cor sólida, ou um comando de efeito.
+// Períodos de animação em tempo de parede. Antes a velocidade vinha de um
+// incremento por frame, o que fazia o mesmo efeito rodar mais devagar em fitas
+// longas (o refresh de 589 LEDs RGBW leva ~23,6 ms e entrava no orçamento).
+#define BREATHING_PERIOD_MS 6800
+#define RAINBOW_PERIOD_MS   3000
+#define FADE_PERIOD_MS      6000
+
+// Mensagens enviadas para a led_task.
 typedef enum {
     LED_MSG_COLOR = 0,
     LED_MSG_EFFECT
@@ -31,21 +40,49 @@ typedef struct {
 typedef struct {
     led_strip_handle_t strip;
     QueueHandle_t queue;
+    // Protege o handle da fita: led_controller_configure() roda na task do
+    // WebSocket e pode destruir o strip enquanto a led_task está dentro de um
+    // led_strip_refresh() com o mesmo handle.
+    SemaphoreHandle_t strip_mutex;
     int count;
     int pin;
     led_strip_type_t type;
     bool config_ready;
-    led_color_t last_color;
+    led_color_t last_color;  // cor sólida BRUTA (sem gamma aplicado)
+    uint32_t frame_ms;       // orçamento de frame, derivado do tamanho da fita
 } led_controller_state_t;
 
 static led_controller_state_t led_state = {
     .strip = NULL,
     .queue = NULL,
+    .strip_mutex = NULL,
     .count = 0,
     .pin = -1,
     .type = LED_STRIP_TYPE_WS2812B,
     .config_ready = false,
-    .last_color = {0}
+    .last_color = {0},
+    .frame_ms = LED_MIN_FRAME_MS
+};
+
+// Correção de gamma 2.2: o olho é logarítmico, o PWM não. Sem isto quase toda
+// a variação visível de uma rampa linear se concentra no topo da escala.
+static const uint8_t GAMMA8[256] = {
+      0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,
+      1,   1,   1,   1,   1,   1,   1,   1,   1,   2,   2,   2,   2,   2,   2,   2,
+      3,   3,   3,   3,   3,   4,   4,   4,   4,   5,   5,   5,   5,   6,   6,   6,
+      6,   7,   7,   7,   8,   8,   8,   9,   9,   9,  10,  10,  11,  11,  11,  12,
+     12,  13,  13,  13,  14,  14,  15,  15,  16,  16,  17,  17,  18,  18,  19,  19,
+     20,  20,  21,  22,  22,  23,  23,  24,  25,  25,  26,  26,  27,  28,  28,  29,
+     30,  30,  31,  32,  33,  33,  34,  35,  35,  36,  37,  38,  39,  39,  40,  41,
+     42,  43,  43,  44,  45,  46,  47,  48,  49,  49,  50,  51,  52,  53,  54,  55,
+     56,  57,  58,  59,  60,  61,  62,  63,  64,  65,  66,  67,  68,  69,  70,  71,
+     73,  74,  75,  76,  77,  78,  79,  81,  82,  83,  84,  85,  87,  88,  89,  90,
+     91,  93,  94,  95,  97,  98,  99, 100, 102, 103, 105, 106, 107, 109, 110, 111,
+    113, 114, 116, 117, 119, 120, 121, 123, 124, 126, 127, 129, 130, 132, 133, 135,
+    137, 138, 140, 141, 143, 145, 146, 148, 149, 151, 153, 154, 156, 158, 159, 161,
+    163, 165, 166, 168, 170, 172, 173, 175, 177, 179, 181, 182, 184, 186, 188, 190,
+    192, 194, 196, 197, 199, 201, 203, 205, 207, 209, 211, 213, 215, 217, 219, 221,
+    223, 225, 227, 229, 231, 234, 236, 238, 240, 242, 244, 246, 248, 251, 253, 255,
 };
 
 static led_model_t led_model_from_type(led_strip_type_t type)
@@ -53,34 +90,85 @@ static led_model_t led_model_from_type(led_strip_type_t type)
     return (type == LED_STRIP_TYPE_SK6812) ? LED_MODEL_SK6812 : LED_MODEL_WS2812;
 }
 
-static bool led_apply_color(const led_color_t *color)
+static inline uint32_t now_ms(void)
 {
-    if (!led_state.strip || !led_state.config_ready)
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+static inline void strip_lock(void)
+{
+    if (led_state.strip_mutex) xSemaphoreTake(led_state.strip_mutex, portMAX_DELAY);
+}
+
+static inline void strip_unlock(void)
+{
+    if (led_state.strip_mutex) xSemaphoreGive(led_state.strip_mutex);
+}
+
+// ===================== FUNIL ÚNICO DE SAÍDA =====================
+// Todo pixel escrito na fita passa por aqui: envelope do efeito -> gamma.
+// `level` é o envelope do efeito (255 = sem atenuação).
+
+static inline uint8_t chan_out(uint8_t base, uint8_t level)
+{
+    if (base == 0)
     {
-        return false;
+        return 0;
     }
 
-    for (int i = 0; i < led_state.count; i++)
+    uint32_t x = ((uint32_t)base * level) / 255;
+
+    uint8_t g = GAMMA8[x];
+    // Piso de 1: o gamma zera entradas <= 14, e um canal aceso não deve apagar
+    // por arredondamento (é o que mantinha o breathing sempre visível).
+    return (g == 0 && x > 0) ? 1 : g;
+}
+
+static inline void put_pixel(int i, led_color_t c, uint8_t level)
+{
+    if (led_state.type == LED_STRIP_TYPE_SK6812)
     {
-        if (led_state.type == LED_STRIP_TYPE_SK6812)
+        led_strip_set_pixel_rgbw(led_state.strip, i,
+                                 chan_out(c.red, level),
+                                 chan_out(c.green, level),
+                                 chan_out(c.blue, level),
+                                 chan_out(c.white, level));
+    }
+    else
+    {
+        led_strip_set_pixel(led_state.strip, i,
+                            chan_out(c.red, level),
+                            chan_out(c.green, level),
+                            chan_out(c.blue, level));
+    }
+}
+
+static bool led_apply_color(const led_color_t *color)
+{
+    bool ok = false;
+
+    strip_lock();
+    if (led_state.strip && led_state.config_ready)
+    {
+        for (int i = 0; i < led_state.count; i++)
         {
-            led_strip_set_pixel_rgbw(led_state.strip, i, color->red, color->green, color->blue, color->white);
+            put_pixel(i, *color, 255);
+        }
+
+        esp_err_t err = led_strip_refresh(led_state.strip);
+        if (err == ESP_OK)
+        {
+            led_state.last_color = *color;
+            ok = true;
         }
         else
         {
-            led_strip_set_pixel(led_state.strip, i, color->red, color->green, color->blue);
+            ESP_LOGE(TAG, "Failed to refresh LED strip: %s", esp_err_to_name(err));
         }
     }
+    strip_unlock();
 
-    esp_err_t err = led_strip_refresh(led_state.strip);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to refresh LED strip: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    led_state.last_color = *color;
-    return true;
+    return ok;
 }
 
 // ===================== EFEITOS (renderizados na led_task) =====================
@@ -107,39 +195,37 @@ static led_color_t hsv_to_rgb(uint8_t h, uint8_t s, uint8_t v)
     return c;
 }
 
-// Escala um canal pelo nível mantendo piso 1 quando o canal é não-nulo,
-// para que o breathing nunca chegue a apagar a fita.
-static uint8_t scale_channel_min1(uint8_t base, uint8_t level)
-{
-    if (base == 0)
-    {
-        return 0;
-    }
-    uint16_t v = ((uint16_t)base * level) / 255;
-    return (v < 1) ? 1 : (uint8_t)v;
-}
-
-static void effect_fill(led_color_t c)
+static void effect_fill(led_color_t c, uint8_t level)
 {
     for (int i = 0; i < led_state.count; i++)
     {
-        if (led_state.type == LED_STRIP_TYPE_SK6812)
-        {
-            led_strip_set_pixel_rgbw(led_state.strip, i, c.red, c.green, c.blue, 0);
-        }
-        else
-        {
-            led_strip_set_pixel(led_state.strip, i, c.red, c.green, c.blue);
-        }
+        put_pixel(i, c, level);
     }
 }
 
-// Renderiza um frame do efeito. NÃO mexe em last_color (a cor sólida fica
-// preservada para quando o efeito for interrompido).
-static void effect_render(led_effect_t effect, const led_color_t *base, uint16_t step)
+static uint32_t effect_period_ms(led_effect_t effect)
 {
+    switch (effect)
+    {
+        case LED_EFFECT_BREATHING: return BREATHING_PERIOD_MS;
+        case LED_EFFECT_RAINBOW:   return RAINBOW_PERIOD_MS;
+        case LED_EFFECT_FADE:      return FADE_PERIOD_MS;
+        default:                   return 1000;
+    }
+}
+
+// Renderiza um frame do efeito a partir do relógio, não de um contador de
+// frames. NÃO mexe em last_color (a cor sólida fica preservada para quando o
+// efeito for interrompido).
+static void effect_render(led_effect_t effect, const led_color_t *base)
+{
+    uint32_t period = effect_period_ms(effect);
+    float phase01 = (float)(now_ms() % period) / (float)period;
+
+    strip_lock();
     if (!led_state.strip || !led_state.config_ready || led_state.count <= 0)
     {
+        strip_unlock();
         return;
     }
 
@@ -147,109 +233,127 @@ static void effect_render(led_effect_t effect, const led_color_t *base, uint16_t
     {
         case LED_EFFECT_BREATHING:
         {
-            // Onda senoidal mapeada para [BREATHING_MIN .. 255]. Nunca apaga:
-            // o piso garante brilho mínimo e scale_channel_min1 mantém >= 1.
-            float phase = (float)(step % 1024) / 1024.0f * 2.0f * (float)M_PI;
-            float wave = (sinf(phase) + 1.0f) / 2.0f; // 0..1
-            const uint8_t BREATHING_MIN = 6;          // piso de brilho (~2%)
+            // Senoide no espaço perceptual: com o gamma aplicado depois, o
+            // brilho *percebido* é que varia senoidalmente.
+            float wave = (sinf(phase01 * 2.0f * (float)M_PI) + 1.0f) / 2.0f; // 0..1
+            const uint8_t BREATHING_MIN = 6;
             uint8_t level = (uint8_t)(BREATHING_MIN + wave * (255 - BREATHING_MIN));
-            led_color_t c = {
-                scale_channel_min1(base->red, level),
-                scale_channel_min1(base->green, level),
-                scale_channel_min1(base->blue, level),
-                0
-            };
-            effect_fill(c);
+            effect_fill(*base, level);
             break;
         }
         case LED_EFFECT_RAINBOW:
         {
+            uint8_t offset = (uint8_t)(phase01 * 256.0f);
             for (int i = 0; i < led_state.count; i++)
             {
-                uint8_t h = (uint8_t)(step + (i * 256) / led_state.count);
+                uint8_t h = (uint8_t)(offset + (i * 256) / led_state.count);
                 led_color_t c = hsv_to_rgb(h, 255, 255);
-                if (led_state.type == LED_STRIP_TYPE_SK6812)
-                {
-                    led_strip_set_pixel_rgbw(led_state.strip, i, c.red, c.green, c.blue, 0);
-                }
-                else
-                {
-                    led_strip_set_pixel(led_state.strip, i, c.red, c.green, c.blue);
-                }
+                put_pixel(i, c, 255);
             }
             break;
         }
         case LED_EFFECT_FADE:
         {
-            led_color_t c = hsv_to_rgb((uint8_t)step, 255, 255);
-            effect_fill(c);
+            led_color_t c = hsv_to_rgb((uint8_t)(phase01 * 256.0f), 255, 255);
+            effect_fill(c, 255);
             break;
         }
         default:
+            strip_unlock();
             return;
     }
 
     led_strip_refresh(led_state.strip);
+    strip_unlock();
 }
 
-static uint16_t effect_step_increment(led_effect_t effect)
+// Orçamento de frame: o refresh de uma fita longa domina o tempo de ciclo
+// (589 LEDs RGBW = 589 * 32 bits * 1,25 us ~= 23,6 ms). Pedir mais fps do que
+// a fita comporta só satura o core 1 e faz o RMT (sem DMA no ESP32) disputar
+// interrupções com o WiFi.
+static uint32_t compute_frame_ms(int count, led_strip_type_t type)
 {
-    switch (effect)
-    {
-        // Breathing usa ciclo de 1024 passos; incremento 3 => ~6.8s por respiração
-        case LED_EFFECT_BREATHING: return 3;
-        case LED_EFFECT_RAINBOW:   return 2;
-        case LED_EFFECT_FADE:      return 1;
-        default:                   return 0;
-    }
+    uint32_t bits = (type == LED_STRIP_TYPE_SK6812) ? 32u : 24u;
+    uint32_t refresh_us = (uint32_t)(((uint64_t)count * bits * 5) / 4); // 1,25 us/bit
+    uint32_t budget_ms = (refresh_us + (refresh_us / 2)) / 1000;        // 1,5x de folga
+    return (budget_ms < LED_MIN_FRAME_MS) ? LED_MIN_FRAME_MS : budget_ms;
 }
 
 // Toda a animação vive aqui: a task fica bloqueada na fila quando ocioso e,
-// quando um efeito está ativo, acorda a cada frame para renderizar.
+// quando um efeito está ativo, acorda mirando um deadline fixo por frame.
 static void led_task(void *arg)
 {
     led_msg_t msg;
     led_effect_t active = LED_EFFECT_NONE;
     led_color_t base = {255, 255, 255, 0};
     led_color_t solid = {0, 0, 0, 0};
-    uint16_t step = 0;
-
-    const TickType_t frame_ticks = pdMS_TO_TICKS(EFFECT_FRAME_MS);
+    int64_t next_frame_us = 0;
 
     while (1)
     {
-        TickType_t wait = (active == LED_EFFECT_NONE) ? portMAX_DELAY : frame_ticks;
-
-        if (xQueueReceive(led_state.queue, &msg, wait) == pdTRUE)
+        TickType_t wait;
+        if (active == LED_EFFECT_NONE)
         {
-            if (msg.type == LED_MSG_COLOR)
-            {
-                active = LED_EFFECT_NONE;
-                solid = msg.color;
-                led_apply_color(&msg.color);
-            }
-            else // LED_MSG_EFFECT
-            {
-                active = msg.effect;
-                base = msg.color;
-                step = 0;
-                if (active == LED_EFFECT_NONE)
-                {
-                    led_apply_color(&solid); // restaura cor sólida
-                }
-            }
+            wait = portMAX_DELAY;
         }
         else
         {
-            // timeout -> próximo frame do efeito
-            effect_render(active, &base, step);
-            step += effect_step_increment(active);
+            // Arredonda para baixo: acordar um tick cedo e renderizar um pouco
+            // antes do deadline é melhor do que passar dele. Como o deadline
+            // avança sempre a partir do anterior, não há drift acumulado.
+            int64_t delta_us = next_frame_us - esp_timer_get_time();
+            wait = (delta_us <= 0) ? 0 : pdMS_TO_TICKS((uint32_t)(delta_us / 1000));
+        }
+
+        if (xQueueReceive(led_state.queue, &msg, wait) == pdTRUE)
+        {
+            switch (msg.type)
+            {
+                case LED_MSG_COLOR:
+                    active = LED_EFFECT_NONE;
+                    solid = msg.color;
+                    led_apply_color(&msg.color);
+                    break;
+
+                case LED_MSG_EFFECT:
+                    active = msg.effect;
+                    base = msg.color;
+                    next_frame_us = esp_timer_get_time();
+                    if (active == LED_EFFECT_NONE)
+                    {
+                        led_apply_color(&solid); // restaura cor sólida
+                    }
+                    break;
+            }
+        }
+        else if (active != LED_EFFECT_NONE)
+        {
+            // deadline atingido -> próximo frame do efeito
+            effect_render(active, &base);
+
+            int64_t now = esp_timer_get_time();
+            next_frame_us += (int64_t)led_state.frame_ms * 1000;
+            if (next_frame_us < now)
+            {
+                // renderização atrasou; não tenta recuperar frames perdidos
+                next_frame_us = now + (int64_t)led_state.frame_ms * 1000;
+            }
         }
     }
 }
 
 bool led_controller_start(void)
 {
+    if (led_state.strip_mutex == NULL)
+    {
+        led_state.strip_mutex = xSemaphoreCreateMutex();
+        if (led_state.strip_mutex == NULL)
+        {
+            ESP_LOGE(TAG, "Failed to create LED strip mutex");
+            return false;
+        }
+    }
+
     if (led_state.queue == NULL)
     {
         led_state.queue = xQueueCreate(LED_QUEUE_LENGTH, sizeof(led_msg_t));
@@ -287,6 +391,18 @@ bool led_controller_configure(int led_pin, int led_count, led_strip_type_t led_t
         return false;
     }
 
+    // Reconexão com a mesma configuração não deve derrubar a fita: além de
+    // evitar o blink, tira a janela em que o strip é destruído sob a led_task.
+    if (led_state.config_ready &&
+        led_state.pin == led_pin &&
+        led_state.count == led_count &&
+        led_state.type == led_type)
+    {
+        ESP_LOGI(TAG, "LED config unchanged (pin=%d count=%d) - keeping strip alive", led_pin, led_count);
+        return true;
+    }
+
+    strip_lock();
     if (led_state.strip != NULL)
     {
         led_strip_clear(led_state.strip);
@@ -326,15 +442,22 @@ bool led_controller_configure(int led_pin, int led_count, led_strip_type_t led_t
         ESP_LOGE(TAG, "Failed to create LED strip: %s", esp_err_to_name(err));
         led_state.strip = NULL;
         led_state.config_ready = false;
+        strip_unlock();
         return false;
     }
 
     led_state.pin = led_pin;
     led_state.count = led_count;
     led_state.type = led_type;
+    led_state.frame_ms = compute_frame_ms(led_count, led_type);
     led_state.config_ready = true;
+    strip_unlock();
 
-    ESP_LOGI(TAG, "LED strip configured: pin=%d, count=%d, type=%d", led_pin, led_count, led_type);
+    ESP_LOGI(TAG, "LED strip configured: pin=%d, count=%d, type=%s, frame=%ums (~%u fps)",
+             led_pin, led_count,
+             (led_type == LED_STRIP_TYPE_SK6812) ? "sk6812" : "ws2812b",
+             (unsigned)led_state.frame_ms,
+             (unsigned)(1000 / led_state.frame_ms));
 
     led_color_t off = {0};
     led_apply_color(&off);

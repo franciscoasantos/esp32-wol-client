@@ -15,6 +15,19 @@ void app_main()
         return;
     }
 
+    // LED antes da rede: com a configuração e a cor na NVS a fita acende em
+    // ~200 ms em vez de ficar apagada durante WiFi + SNTP + TLS + get_config.
+    if (!led_controller_start())
+    {
+        ESP_LOGE(TAG, "Failed to start LED controller");
+        return;
+    }
+
+    if (!led_controller_restore())
+    {
+        ESP_LOGI(TAG, "No LED state in NVS; waiting for server config");
+    }
+
     wifi_init();
 
     char device_mac[18] = "00:00:00:00:00:00";
@@ -25,12 +38,6 @@ void app_main()
     }
 
     sync_time();
-
-    if (!led_controller_start())
-    {
-        ESP_LOGE(TAG, "Failed to start LED controller");
-        return;
-    }
 
     ws_client_start(device_mac);
 }

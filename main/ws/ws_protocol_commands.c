@@ -68,6 +68,17 @@ static bool handle_wol_command(cJSON *root, esp_websocket_client_handle_t client
     return true;
 }
 
+// fadeMs opcional, compartilhado por led/gradient/segments.
+static uint16_t parse_fade_ms(cJSON *root)
+{
+    cJSON *fade_json = cJSON_GetObjectItemCaseSensitive(root, "fadeMs");
+    if (cJSON_IsNumber(fade_json) && fade_json->valuedouble > 0)
+    {
+        return (fade_json->valuedouble > 60000) ? 60000 : (uint16_t)fade_json->valueint;
+    }
+    return 0;
+}
+
 static bool handle_led_command(cJSON *root, esp_websocket_client_handle_t client)
 {
     cJSON *r = cJSON_GetObjectItemCaseSensitive(root, "r");
@@ -99,7 +110,9 @@ static bool handle_led_command(cJSON *root, esp_websocket_client_handle_t client
         color.white = 0;
     }
 
-    if (!led_controller_enqueue(&color, 100))
+    // fadeMs opcional: 0 (ou ausente) aplica na hora. O seletor de cor manda 0
+    // porque já envia uma cor a cada 140 ms; cenas e rampas mandam algo maior.
+    if (!led_controller_enqueue_fade(&color, parse_fade_ms(root), 100))
     {
         ws_protocol_send_error(client, "led", "LED queue busy");
         return false;
@@ -122,6 +135,176 @@ static bool handle_led_command(cJSON *root, esp_websocket_client_handle_t client
     return true;
 }
 
+// Lê r/g/b/w de um objeto qualquer (stop ou segmento). w é opcional.
+static bool parse_color_fields(cJSON *obj, led_color_t *color)
+{
+    cJSON *r = cJSON_GetObjectItemCaseSensitive(obj, "r");
+    cJSON *g = cJSON_GetObjectItemCaseSensitive(obj, "g");
+    cJSON *b = cJSON_GetObjectItemCaseSensitive(obj, "b");
+    cJSON *w = cJSON_GetObjectItemCaseSensitive(obj, "w");
+
+    if (!ws_protocol_cjson_to_u8(r, &color->red) ||
+        !ws_protocol_cjson_to_u8(g, &color->green) ||
+        !ws_protocol_cjson_to_u8(b, &color->blue))
+    {
+        return false;
+    }
+
+    color->white = 0;
+    ws_protocol_cjson_to_u8(w, &color->white);
+    return true;
+}
+
+// Parsing de padrão compartilhado entre os comandos gradient/segments e o
+// `lastPattern` que vem no config — assim reconectar não desfaz um gradiente.
+// Devolvem NULL em sucesso ou o código de erro a ser ecoado.
+
+static const char *parse_gradient_stops(cJSON *stops, led_pattern_t *out)
+{
+    if (!cJSON_IsArray(stops)) return "invalid_stops";
+
+    memset(out, 0, sizeof(*out));
+    out->type = LED_PATTERN_GRADIENT;
+
+    cJSON *stop = NULL;
+    cJSON_ArrayForEach(stop, stops)
+    {
+        if (out->stop_count >= LED_MAX_STOPS) break;
+
+        led_stop_t entry = {0};
+        cJSON *pos = cJSON_GetObjectItemCaseSensitive(stop, "pos");
+        if (!ws_protocol_cjson_to_u8(pos, &entry.pos) || !parse_color_fields(stop, &entry.color))
+        {
+            return "invalid_stops";
+        }
+
+        // Stops precisam vir em ordem crescente: a busca por pixel assume isso.
+        if (out->stop_count > 0 && entry.pos < out->stops[out->stop_count - 1].pos)
+        {
+            return "stops_out_of_order";
+        }
+
+        out->stops[out->stop_count++] = entry;
+    }
+
+    return (out->stop_count < 2) ? "need_two_stops" : NULL;
+}
+
+static const char *parse_segments_array(cJSON *segments, led_pattern_t *out)
+{
+    if (!cJSON_IsArray(segments)) return "invalid_segments";
+
+    memset(out, 0, sizeof(*out));
+    out->type = LED_PATTERN_SEGMENTS;
+
+    cJSON *segment = NULL;
+    cJSON_ArrayForEach(segment, segments)
+    {
+        if (out->segment_count >= LED_MAX_SEGMENTS) break;
+
+        cJSON *from = cJSON_GetObjectItemCaseSensitive(segment, "from");
+        cJSON *to = cJSON_GetObjectItemCaseSensitive(segment, "to");
+        led_segment_t entry = {0};
+
+        if (!cJSON_IsNumber(from) || !cJSON_IsNumber(to) ||
+            from->valueint < 0 || to->valueint < from->valueint ||
+            !parse_color_fields(segment, &entry.color))
+        {
+            return "invalid_segments";
+        }
+
+        entry.from = (uint16_t)from->valueint;
+        entry.to = (uint16_t)to->valueint;
+        out->segments[out->segment_count++] = entry;
+    }
+
+    return (out->segment_count == 0) ? "need_one_segment" : NULL;
+}
+
+// { "type": "solid|gradient|segments", ... } — usado pelo lastPattern do config.
+static bool parse_pattern_object(cJSON *obj, led_pattern_t *out)
+{
+    if (!cJSON_IsObject(obj)) return false;
+
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(obj, "type");
+    const char *name = (cJSON_IsString(type) && type->valuestring) ? type->valuestring : "solid";
+
+    if (strcmp(name, "gradient") == 0)
+    {
+        return parse_gradient_stops(cJSON_GetObjectItemCaseSensitive(obj, "stops"), out) == NULL;
+    }
+
+    if (strcmp(name, "segments") == 0)
+    {
+        return parse_segments_array(cJSON_GetObjectItemCaseSensitive(obj, "segments"), out) == NULL;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->type = LED_PATTERN_SOLID;
+    cJSON *color = cJSON_GetObjectItemCaseSensitive(obj, "color");
+    return parse_color_fields(cJSON_IsObject(color) ? color : obj, &out->solid);
+}
+// Gradiente por stops: posição 0-255 ao longo da fita. O firmware interpola
+// entre eles, então o payload não cresce com o tamanho da fita.
+static bool handle_gradient_command(cJSON *root, esp_websocket_client_handle_t client)
+{
+    if (!led_controller_is_configured())
+    {
+        ws_protocol_send_error(client, "gradient", "LED not configured");
+        return false;
+    }
+
+    led_pattern_t pattern;
+    const char *error = parse_gradient_stops(cJSON_GetObjectItemCaseSensitive(root, "stops"), &pattern);
+    if (error)
+    {
+        ws_protocol_send_error(client, "gradient", error);
+        return false;
+    }
+
+    if (!led_controller_set_pattern(&pattern, parse_fade_ms(root), 100))
+    {
+        ws_protocol_send_error(client, "gradient", "LED queue busy");
+        return false;
+    }
+
+    char response[96];
+    snprintf(response, sizeof(response),
+             "{\"status\":\"ok\",\"action\":\"gradient\",\"stops\":%u}", pattern.stop_count);
+    ws_protocol_send_json(client, response);
+    return true;
+}
+
+// Trechos da fita com cores próprias. Pixel fora de qualquer trecho fica apagado.
+static bool handle_segments_command(cJSON *root, esp_websocket_client_handle_t client)
+{
+    if (!led_controller_is_configured())
+    {
+        ws_protocol_send_error(client, "segments", "LED not configured");
+        return false;
+    }
+
+    led_pattern_t pattern;
+    const char *error = parse_segments_array(cJSON_GetObjectItemCaseSensitive(root, "segments"), &pattern);
+    if (error)
+    {
+        ws_protocol_send_error(client, "segments", error);
+        return false;
+    }
+
+    if (!led_controller_set_pattern(&pattern, parse_fade_ms(root), 100))
+    {
+        ws_protocol_send_error(client, "segments", "LED queue busy");
+        return false;
+    }
+
+    char response[96];
+    snprintf(response, sizeof(response),
+             "{\"status\":\"ok\",\"action\":\"segments\",\"segments\":%u}", pattern.segment_count);
+    ws_protocol_send_json(client, response);
+    return true;
+}
+
 static bool handle_effect_command(cJSON *root, esp_websocket_client_handle_t client)
 {
     if (!led_controller_is_configured())
@@ -135,20 +318,42 @@ static bool handle_effect_command(cJSON *root, esp_websocket_client_handle_t cli
                                   ? effect_json->valuestring
                                   : "none";
 
+    static const struct { const char *name; led_effect_t value; } EFFECT_NAMES[] = {
+        { "breathing", LED_EFFECT_BREATHING },
+        { "rainbow",   LED_EFFECT_RAINBOW },
+        { "fade",      LED_EFFECT_FADE },
+        { "fire",      LED_EFFECT_FIRE },
+        { "comet",     LED_EFFECT_COMET },
+        { "twinkle",   LED_EFFECT_TWINKLE },
+        { "wave",      LED_EFFECT_WAVE },
+        { "wipe",      LED_EFFECT_WIPE },
+    };
+
     led_effect_t effect = LED_EFFECT_NONE;
-    if (strcmp(effect_name, "breathing") == 0)
+    // `resolved` aponta sempre para um literal desta tabela (ou "none"), nunca
+    // para a string recebida: é o que garante que o eco no ACK não possa
+    // injetar aspas e quebrar o JSON de resposta.
+    const char *resolved = "none";
+    bool known = (strcmp(effect_name, "none") == 0);
+
+    for (size_t i = 0; i < sizeof(EFFECT_NAMES) / sizeof(EFFECT_NAMES[0]); i++)
     {
-        effect = LED_EFFECT_BREATHING;
+        if (strcmp(effect_name, EFFECT_NAMES[i].name) == 0)
+        {
+            effect = EFFECT_NAMES[i].value;
+            resolved = EFFECT_NAMES[i].name;
+            known = true;
+            break;
+        }
     }
-    else if (strcmp(effect_name, "rainbow") == 0)
+
+    // Antes um nome desconhecido interrompia o efeito e respondia status "ok",
+    // então um typo virava "parou de funcionar, sem erro nenhum".
+    if (!known)
     {
-        effect = LED_EFFECT_RAINBOW;
+        ws_protocol_send_error(client, "effect", "unknown_effect");
+        return false;
     }
-    else if (strcmp(effect_name, "fade") == 0)
-    {
-        effect = LED_EFFECT_FADE;
-    }
-    // "none" (ou desconhecido) mantém LED_EFFECT_NONE -> interrompe o efeito
 
     // Cor base opcional (usada por efeitos como breathing)
     led_color_t base = {0};
@@ -163,7 +368,20 @@ static bool handle_effect_command(cJSON *root, esp_websocket_client_handle_t cli
         base_ptr = &base;
     }
 
-    if (!led_controller_set_effect(effect, base_ptr, 100))
+    // speed/intensity opcionais (0..100). Ausentes = padrão de cada efeito.
+    led_effect_params_t params = { LED_PARAM_DEFAULT, LED_PARAM_DEFAULT };
+    cJSON *speed_json = cJSON_GetObjectItemCaseSensitive(root, "speed");
+    cJSON *intensity_json = cJSON_GetObjectItemCaseSensitive(root, "intensity");
+    if (cJSON_IsNumber(speed_json) && speed_json->valueint >= 0 && speed_json->valueint <= 100)
+    {
+        params.speed = (uint8_t)speed_json->valueint;
+    }
+    if (cJSON_IsNumber(intensity_json) && intensity_json->valueint >= 0 && intensity_json->valueint <= 100)
+    {
+        params.intensity = (uint8_t)intensity_json->valueint;
+    }
+
+    if (!led_controller_set_effect(effect, base_ptr, &params, 100))
     {
         ws_protocol_send_error(client, "effect", "LED queue busy");
         return false;
@@ -171,7 +389,7 @@ static bool handle_effect_command(cJSON *root, esp_websocket_client_handle_t cli
 
     char response[96];
     snprintf(response, sizeof(response),
-             "{\"status\":\"ok\",\"action\":\"effect\",\"effect\":\"%s\"}", effect_name);
+             "{\"status\":\"ok\",\"action\":\"effect\",\"effect\":\"%s\"}", resolved);
     ws_protocol_send_json(client, response);
     return true;
 }
@@ -223,9 +441,20 @@ static bool handle_config_message(cJSON *root, esp_websocket_client_handle_t cli
             return false;
         }
 
+        // lastPattern tem prioridade: sem ele, reconectar com um gradiente na
+        // fita jogaria uma cor sólida por cima do que a NVS acabou de restaurar.
+        static led_pattern_t initial_pattern;
+        cJSON *last_pattern_json = cJSON_GetObjectItemCaseSensitive(root, "lastPattern");
+        bool pattern_applied = false;
+        if (parse_pattern_object(last_pattern_json, &initial_pattern))
+        {
+            led_controller_set_pattern(&initial_pattern, 0, 100);
+            pattern_applied = true;
+        }
+
         // Se houver lastLedColor, já define a cor inicial
         cJSON *last_color_json = cJSON_GetObjectItemCaseSensitive(root, "lastLedColor");
-        if (cJSON_IsObject(last_color_json))
+        if (!pattern_applied && cJSON_IsObject(last_color_json))
         {
             cJSON *r = cJSON_GetObjectItemCaseSensitive(last_color_json, "r");
             cJSON *g = cJSON_GetObjectItemCaseSensitive(last_color_json, "g");
@@ -338,6 +567,14 @@ void ws_protocol_handle_complete_text(esp_websocket_client_handle_t client, cons
     else if (strcmp(action, "effect") == 0)
     {
         handle_effect_command(root, client);
+    }
+    else if (strcmp(action, "gradient") == 0)
+    {
+        handle_gradient_command(root, client);
+    }
+    else if (strcmp(action, "segments") == 0)
+    {
+        handle_segments_command(root, client);
     }
     else if (strcmp(action, "ping") == 0)
     {

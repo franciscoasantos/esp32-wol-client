@@ -2,12 +2,14 @@
 
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "nvs.h"
 #include "led_strip.h"
 
@@ -30,24 +32,31 @@ static const char *TAG = "led_controller";
 #define BREATHING_PERIOD_MS 6800
 #define RAINBOW_PERIOD_MS   3000
 #define FADE_PERIOD_MS      6000
+#define FIRE_PERIOD_MS      1000   // o fogo é iterativo; o período só regula o passo
+#define COMET_PERIOD_MS     2000
+#define TWINKLE_PERIOD_MS   4000
+#define WAVE_PERIOD_MS      5000
+#define WIPE_PERIOD_MS      3000
 
 #define NVS_NS        "espnest_led"
 #define NVS_KEY_PIN   "pin"
 #define NVS_KEY_COUNT "count"
 #define NVS_KEY_TYPE  "type"
-#define NVS_KEY_COLOR "color"
+#define NVS_KEY_PATTERN "pattern"
 
 // Mensagens enviadas para a led_task.
 typedef enum {
-    LED_MSG_COLOR = 0,
+    LED_MSG_PATTERN = 0,
     LED_MSG_EFFECT
 } led_msg_type_t;
 
 typedef struct {
     led_msg_type_t type;
-    led_color_t color;      // cor sólida (COLOR) ou cor base do efeito (EFFECT)
+    led_pattern_t pattern;  // usado quando type == LED_MSG_PATTERN
+    led_color_t color;      // cor base do efeito (EFFECT)
     led_effect_t effect;    // usado quando type == LED_MSG_EFFECT
-    uint16_t fade_ms;       // usado quando type == LED_MSG_COLOR (0 = imediato)
+    led_effect_params_t params; // idem
+    uint16_t fade_ms;       // usado quando type == LED_MSG_PATTERN (0 = imediato)
 } led_msg_t;
 
 typedef struct {
@@ -63,6 +72,7 @@ typedef struct {
     bool config_ready;
     led_color_t last_color;  // cor sólida BRUTA (sem gamma aplicado)
     uint32_t frame_ms;       // orçamento de frame, derivado do tamanho da fita
+    uint8_t *heat;           // mapa de calor do efeito fogo (1 byte por LED)
 } led_controller_state_t;
 
 static led_controller_state_t led_state = {
@@ -74,8 +84,53 @@ static led_controller_state_t led_state = {
     .type = LED_STRIP_TYPE_WS2812B,
     .config_ready = false,
     .last_color = {0},
-    .frame_ms = LED_MIN_FRAME_MS
+    .frame_ms = LED_MIN_FRAME_MS,
+    .heat = NULL
 };
+
+// Seno 0..255 indexado por ângulo 0..255, montado no start(). Fica em RAM (256
+// bytes) em vez de na flash, que é o recurso apertado neste projeto.
+static uint8_t SIN8[256];
+
+static void build_sin_table(void)
+{
+    for (int i = 0; i < 256; i++)
+    {
+        float a = (float)i / 256.0f * 2.0f * (float)M_PI;
+        SIN8[i] = (uint8_t)((sinf(a) + 1.0f) * 127.5f);
+    }
+}
+
+// xorshift32: o inner loop do fogo e do twinkle chama isto por pixel, então
+// vale evitar o custo do esp_random() a cada chamada.
+static uint32_t rng_state = 0x2545F491u;
+
+static inline uint32_t fast_rand(void)
+{
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return rng_state;
+}
+
+static inline uint32_t hash32(uint32_t x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+static inline uint8_t qsub8(uint8_t a, uint8_t b) { return (a > b) ? (uint8_t)(a - b) : 0; }
+static inline uint8_t qadd8(uint8_t a, uint8_t b) { uint16_t s = (uint16_t)a + b; return (s > 255) ? 255 : (uint8_t)s; }
+
+// Resolve um parâmetro 0..100, caindo no padrão do efeito quando não veio.
+static inline uint8_t param_or(uint8_t value, uint8_t fallback)
+{
+    return (value > 100) ? fallback : value;
+}
 
 // Correção de gamma 2.2: o olho é logarítmico, o PWM não. Sem isto quase toda
 // a variação visível de uma rampa linear se concentra no topo da escala.
@@ -140,15 +195,15 @@ static void nvs_save_config(int pin, int count, led_strip_type_t type)
     nvs_close(h);
 }
 
-static void nvs_save_color(const led_color_t *color)
+static void nvs_save_pattern(const led_pattern_t *pattern)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK)
     {
-        ESP_LOGW(TAG, "NVS open failed; color not persisted");
+        ESP_LOGW(TAG, "NVS open failed; pattern not persisted");
         return;
     }
-    nvs_set_blob(h, NVS_KEY_COLOR, color, sizeof(*color));
+    nvs_set_blob(h, NVS_KEY_PATTERN, pattern, sizeof(*pattern));
     nvs_commit(h);
     nvs_close(h);
 }
@@ -191,7 +246,87 @@ static inline void put_pixel(int i, led_color_t c, uint8_t level)
     }
 }
 
-static bool led_apply_color(const led_color_t *color)
+// ===================== PADRÕES ESTÁTICOS =====================
+
+static inline uint8_t lerp8(uint8_t a, uint8_t b, uint32_t num, uint32_t den)
+{
+    if (den == 0) return b;
+    int32_t delta = (int32_t)b - (int32_t)a;
+    return (uint8_t)((int32_t)a + (delta * (int32_t)num) / (int32_t)den);
+}
+
+// Interpola no espaço bruto (pré-gamma), que é onde as cores são
+// perceptualmente uniformes — o gamma é aplicado depois, no funil de saída.
+static led_color_t color_lerp(led_color_t a, led_color_t b, uint32_t num, uint32_t den)
+{
+    led_color_t c;
+    c.red   = lerp8(a.red,   b.red,   num, den);
+    c.green = lerp8(a.green, b.green, num, den);
+    c.blue  = lerp8(a.blue,  b.blue,  num, den);
+    c.white = lerp8(a.white, b.white, num, den);
+    return c;
+}
+
+static void pattern_make_solid(led_pattern_t *pattern, const led_color_t *color)
+{
+    memset(pattern, 0, sizeof(*pattern));
+    pattern->type = LED_PATTERN_SOLID;
+    pattern->solid = *color;
+}
+
+// Cor do padrão no pixel `i`. Roda uma vez por pixel por frame; o laço de
+// stops é O(8) no pior caso, o que some perto do custo do refresh.
+static led_color_t pattern_color_at(const led_pattern_t *pattern, int i, int count)
+{
+    const led_color_t black = {0, 0, 0, 0};
+
+    switch (pattern->type)
+    {
+        case LED_PATTERN_GRADIENT:
+        {
+            if (pattern->stop_count == 0) return black;
+            if (pattern->stop_count == 1) return pattern->stops[0].color;
+
+            uint8_t pos = (count > 1)
+                ? (uint8_t)(((uint32_t)i * 255u) / (uint32_t)(count - 1))
+                : 0;
+
+            if (pos <= pattern->stops[0].pos) return pattern->stops[0].color;
+
+            for (int s = 0; s < pattern->stop_count - 1; s++)
+            {
+                uint8_t a = pattern->stops[s].pos;
+                uint8_t b = pattern->stops[s + 1].pos;
+                if (pos <= b)
+                {
+                    uint32_t den = (b > a) ? (uint32_t)(b - a) : 1u;
+                    uint32_t num = (pos > a) ? (uint32_t)(pos - a) : 0u;
+                    return color_lerp(pattern->stops[s].color, pattern->stops[s + 1].color, num, den);
+                }
+            }
+            return pattern->stops[pattern->stop_count - 1].color;
+        }
+
+        case LED_PATTERN_SEGMENTS:
+        {
+            for (int s = 0; s < pattern->segment_count; s++)
+            {
+                if (i >= (int)pattern->segments[s].from && i <= (int)pattern->segments[s].to)
+                {
+                    return pattern->segments[s].color;
+                }
+            }
+            return black; // pixel fora de qualquer segmento fica apagado
+        }
+
+        case LED_PATTERN_SOLID:
+        default:
+            return pattern->solid;
+    }
+}
+
+// Renderiza um padrão, ou a interpolação entre dois quando `from` não é NULL.
+static bool apply_pattern(const led_pattern_t *from, const led_pattern_t *to, uint32_t num, uint32_t den)
 {
     bool ok = false;
 
@@ -200,13 +335,20 @@ static bool led_apply_color(const led_color_t *color)
     {
         for (int i = 0; i < led_state.count; i++)
         {
-            put_pixel(i, *color, 255);
+            led_color_t c = pattern_color_at(to, i, led_state.count);
+            if (from)
+            {
+                c = color_lerp(pattern_color_at(from, i, led_state.count), c, num, den);
+            }
+            put_pixel(i, c, 255);
         }
 
         esp_err_t err = led_strip_refresh(led_state.strip);
         if (err == ESP_OK)
         {
-            led_state.last_color = *color;
+            // Cor representativa do padrão: é o que vai no state_report, já
+            // que o protocolo de estado ainda fala em uma cor só.
+            led_state.last_color = pattern_color_at(to, 0, led_state.count);
             ok = true;
         }
         else
@@ -217,6 +359,13 @@ static bool led_apply_color(const led_color_t *color)
     strip_unlock();
 
     return ok;
+}
+
+static bool led_apply_color(const led_color_t *color)
+{
+    led_pattern_t pattern;
+    pattern_make_solid(&pattern, color);
+    return apply_pattern(NULL, &pattern, 0, 0);
 }
 
 // ===================== EFEITOS (renderizados na led_task) =====================
@@ -251,23 +400,186 @@ static void effect_fill(led_color_t c, uint8_t level)
     }
 }
 
-static uint32_t effect_period_ms(led_effect_t effect)
+static uint32_t effect_base_period_ms(led_effect_t effect)
 {
     switch (effect)
     {
         case LED_EFFECT_BREATHING: return BREATHING_PERIOD_MS;
         case LED_EFFECT_RAINBOW:   return RAINBOW_PERIOD_MS;
         case LED_EFFECT_FADE:      return FADE_PERIOD_MS;
+        case LED_EFFECT_FIRE:      return FIRE_PERIOD_MS;
+        case LED_EFFECT_COMET:     return COMET_PERIOD_MS;
+        case LED_EFFECT_TWINKLE:   return TWINKLE_PERIOD_MS;
+        case LED_EFFECT_WAVE:      return WAVE_PERIOD_MS;
+        case LED_EFFECT_WIPE:      return WIPE_PERIOD_MS;
         default:                   return 1000;
+    }
+}
+
+// speed 0..100 -> período de 4x (lento) a 1/4x (rápido); 50 mantém o padrão.
+static uint32_t scale_period(uint32_t base_ms, uint8_t speed)
+{
+    uint32_t pct = (speed <= 50)
+        ? (400u - (uint32_t)speed * 6u)
+        : (100u - ((uint32_t)(speed - 50) * 3u) / 2u);
+    if (pct < 5) pct = 5;
+    uint32_t scaled = (base_ms * pct) / 100u;
+    return (scaled < 50) ? 50 : scaled;
+}
+
+// Intensidade padrão por efeito: o que faz cada um parecer "certo" sem ajuste.
+static uint8_t effect_default_intensity(led_effect_t effect)
+{
+    switch (effect)
+    {
+        case LED_EFFECT_BREATHING: return 100; // profundidade cheia (look original)
+        case LED_EFFECT_FIRE:      return 55;
+        case LED_EFFECT_COMET:     return 50;  // cauda ~30% da fita
+        case LED_EFFECT_TWINKLE:   return 40;  // densidade de estrelas
+        case LED_EFFECT_WAVE:      return 60;  // número de cristas
+        case LED_EFFECT_WIPE:      return 50;  // suavidade da borda
+        default:                   return 50;
+    }
+}
+
+// Fogo estilo Fire2012: esfria, difunde para cima e solta faíscas na base.
+// É o único efeito com estado entre frames (o mapa de calor).
+static void render_fire(uint8_t intensity)
+{
+    const int n = led_state.count;
+    uint8_t *heat = led_state.heat;
+    if (!heat || n <= 0) return;
+
+    // Fita longa dissipa mais devagar por LED, senão a chama nunca sobe.
+    uint8_t cooling = (uint8_t)(((55u + (100u - intensity)) * 10u) / (uint32_t)(n > 0 ? n : 1) + 2u);
+    uint8_t sparking = (uint8_t)(60 + (intensity * 145) / 100);
+
+    for (int i = 0; i < n; i++)
+    {
+        heat[i] = qsub8(heat[i], (uint8_t)(fast_rand() % (cooling + 1u)));
+    }
+
+    for (int k = n - 1; k >= 2; k--)
+    {
+        heat[k] = (uint8_t)(((uint16_t)heat[k - 1] + heat[k - 2] + heat[k - 2]) / 3);
+    }
+
+    if ((fast_rand() % 255u) < sparking)
+    {
+        int y = (int)(fast_rand() % 7u);
+        if (y < n) heat[y] = qadd8(heat[y], (uint8_t)(160 + fast_rand() % 96u));
+    }
+
+    // Rampa preto -> vermelho -> amarelo -> branco.
+    for (int i = 0; i < n; i++)
+    {
+        uint8_t h = heat[i];
+        uint8_t t192 = (uint8_t)(((uint16_t)h * 191) / 255);
+        uint8_t heatramp = (uint8_t)((t192 & 0x3F) << 2);
+        led_color_t c = {0, 0, 0, 0};
+        if (t192 > 128)      { c.red = 255; c.green = 255; c.blue = heatramp; }
+        else if (t192 > 64)  { c.red = 255; c.green = heatramp; }
+        else                 { c.red = heatramp; }
+        put_pixel(i, c, 255);
+    }
+}
+
+// Cabeça deslizando com cauda que decai; sem estado entre frames.
+static void render_comet(const led_color_t *base, float phase01, uint8_t intensity)
+{
+    const int n = led_state.count;
+    int tail = (int)((uint32_t)n * (5u + intensity / 2u) / 100u);
+    if (tail < 1) tail = 1;
+
+    float head = phase01 * (float)n;
+
+    for (int i = 0; i < n; i++)
+    {
+        float d = head - (float)i;
+        if (d < 0) d += (float)n;
+        uint8_t level = 0;
+        if (d < (float)tail)
+        {
+            level = (uint8_t)(255.0f * (1.0f - d / (float)tail));
+        }
+        put_pixel(i, *base, level);
+    }
+}
+
+// Estrelas piscando sobre um piso fraco. Sem buffer: quem acende e quando sai
+// de um hash de (índice, janela de tempo).
+static void render_twinkle(const led_color_t *base, uint32_t period, uint8_t intensity)
+{
+    const int n = led_state.count;
+    const uint8_t FLOOR_LEVEL = 10;
+    uint32_t t = now_ms();
+    uint32_t slot = t / period;
+    uint32_t density = 5u + ((uint32_t)intensity * 45u) / 100u; // 5%..50% dos LEDs
+
+    for (int i = 0; i < n; i++)
+    {
+        uint32_t h = hash32((uint32_t)i * 2654435761u ^ slot);
+        uint8_t level = FLOOR_LEVEL;
+
+        if ((h % 100u) < density)
+        {
+            uint32_t offset = (h >> 8) % period;
+            uint32_t frac = ((t + offset) % period) * 255u / period;
+            // Pulso triangular: sobe até a metade da janela e volta.
+            uint8_t pulse = (frac < 128) ? (uint8_t)(frac * 2) : (uint8_t)((255 - frac) * 2);
+            if (pulse > FLOOR_LEVEL) level = pulse;
+        }
+
+        put_pixel(i, *base, level);
+    }
+}
+
+// Duas senoides defasadas somadas; o clássico "plasma" barato.
+static void render_wave(const led_color_t *base, float phase01, uint8_t intensity)
+{
+    const int n = led_state.count;
+    uint32_t crests = 1u + ((uint32_t)intensity * 5u) / 100u;
+    uint8_t p1 = (uint8_t)(phase01 * 256.0f);
+    uint8_t p2 = (uint8_t)(phase01 * 179.0f); // ~0.7x, para as ondas não baterem
+
+    for (int i = 0; i < n; i++)
+    {
+        uint32_t spatial = ((uint32_t)i * 256u * crests) / (uint32_t)n;
+        uint8_t a = SIN8[(uint8_t)(p1 + spatial)];
+        uint8_t b = SIN8[(uint8_t)(p2 + (spatial * 3u) / 5u + 77u)];
+        put_pixel(i, *base, (uint8_t)(((uint16_t)a + b) / 2));
+    }
+}
+
+// Preenche progressivamente e recomeça; a borda tem um degradê de saída.
+static void render_wipe(const led_color_t *base, float phase01, uint8_t intensity)
+{
+    const int n = led_state.count;
+    int feather = (int)((uint32_t)n * (1u + intensity / 5u) / 100u);
+    if (feather < 1) feather = 1;
+
+    int filled = (int)(phase01 * (float)(n + feather));
+
+    for (int i = 0; i < n; i++)
+    {
+        uint8_t level;
+        // Atrás da borda já está cheio; na borda vai de 0 (cabeça) a 255.
+        if (i < filled - feather)      level = 255;
+        else if (i > filled)           level = 0;
+        else                           level = (uint8_t)(((filled - i) * 255) / feather);
+        put_pixel(i, *base, level);
     }
 }
 
 // Renderiza um frame do efeito a partir do relógio, não de um contador de
 // frames. NÃO mexe em last_color (a cor sólida fica preservada para quando o
 // efeito for interrompido).
-static void effect_render(led_effect_t effect, const led_color_t *base)
+static void effect_render(led_effect_t effect, const led_color_t *base, const led_effect_params_t *params)
 {
-    uint32_t period = effect_period_ms(effect);
+    uint8_t speed = param_or(params->speed, 50);
+    uint8_t intensity = param_or(params->intensity, effect_default_intensity(effect));
+
+    uint32_t period = scale_period(effect_base_period_ms(effect), speed);
     float phase01 = (float)(now_ms() % period) / (float)period;
 
     strip_lock();
@@ -284,8 +596,9 @@ static void effect_render(led_effect_t effect, const led_color_t *base)
             // Senoide no espaço perceptual: com o gamma aplicado depois, o
             // brilho *percebido* é que varia senoidalmente.
             float wave = (sinf(phase01 * 2.0f * (float)M_PI) + 1.0f) / 2.0f; // 0..1
-            const uint8_t BREATHING_MIN = 6;
-            uint8_t level = (uint8_t)(BREATHING_MIN + wave * (255 - BREATHING_MIN));
+            // intensity = profundidade: 100 chega quase a apagar, 0 quase não pulsa.
+            uint8_t floor_level = (uint8_t)(255 - ((uint32_t)intensity * 249u) / 100u);
+            uint8_t level = (uint8_t)(floor_level + wave * (255 - floor_level));
             effect_fill(*base, level);
             break;
         }
@@ -306,6 +619,21 @@ static void effect_render(led_effect_t effect, const led_color_t *base)
             effect_fill(c, 255);
             break;
         }
+        case LED_EFFECT_FIRE:
+            render_fire(intensity);
+            break;
+        case LED_EFFECT_COMET:
+            render_comet(base, phase01, intensity);
+            break;
+        case LED_EFFECT_TWINKLE:
+            render_twinkle(base, period, intensity);
+            break;
+        case LED_EFFECT_WAVE:
+            render_wave(base, phase01, intensity);
+            break;
+        case LED_EFFECT_WIPE:
+            render_wipe(base, phase01, intensity);
+            break;
         default:
             strip_unlock();
             return;
@@ -315,26 +643,6 @@ static void effect_render(led_effect_t effect, const led_color_t *base)
     strip_unlock();
 }
 
-// ===================== TRANSIÇÃO (crossfade) =====================
-
-static inline uint8_t lerp8(uint8_t a, uint8_t b, uint32_t num, uint32_t den)
-{
-    if (den == 0) return b;
-    int32_t delta = (int32_t)b - (int32_t)a;
-    return (uint8_t)((int32_t)a + (delta * (int32_t)num) / (int32_t)den);
-}
-
-// Interpola no espaço bruto (pré-gamma), que é onde as cores são
-// perceptualmente uniformes — o gamma é aplicado depois, no funil de saída.
-static led_color_t color_lerp(led_color_t a, led_color_t b, uint32_t num, uint32_t den)
-{
-    led_color_t c;
-    c.red   = lerp8(a.red,   b.red,   num, den);
-    c.green = lerp8(a.green, b.green, num, den);
-    c.blue  = lerp8(a.blue,  b.blue,  num, den);
-    c.white = lerp8(a.white, b.white, num, den);
-    return c;
-}
 
 // Orçamento de frame: o refresh de uma fita longa domina o tempo de ciclo
 // (589 LEDs RGBW = 589 * 32 bits * 1,25 us ~= 23,6 ms). Pedir mais fps do que
@@ -356,18 +664,22 @@ static void led_task(void *arg)
     led_msg_t msg;
     led_effect_t active = LED_EFFECT_NONE;
     led_color_t base = {255, 255, 255, 0};
-    led_color_t solid = {0, 0, 0, 0};
+    led_effect_params_t params = { LED_PARAM_DEFAULT, LED_PARAM_DEFAULT };
     int64_t next_frame_us = 0;
 
+    // Padrão atual da fita quando nenhum efeito está rodando.
+    static led_pattern_t current;
+    static led_pattern_t fade_from;
+    static led_pattern_t saved;
+    const led_color_t off = {0, 0, 0, 0};
+    pattern_make_solid(&current, &off);
+
     bool fading = false;
-    led_color_t fade_from = {0};
-    led_color_t fade_to = {0};
     int64_t fade_start_us = 0;
     uint32_t fade_ms = 0;
 
     bool save_pending = false;
     int64_t save_deadline_us = 0;
-    led_color_t saved_color = {0};
     bool saved_valid = false;
 
     while (1)
@@ -397,21 +709,21 @@ static void led_task(void *arg)
         {
             switch (msg.type)
             {
-                case LED_MSG_COLOR:
+                case LED_MSG_PATTERN:
                     active = LED_EFFECT_NONE;
                     if (msg.fade_ms == 0)
                     {
                         fading = false;
-                        solid = msg.color;
-                        led_apply_color(&solid);
+                        current = msg.pattern;
+                        apply_pattern(NULL, &current, 0, 0);
                     }
                     else
                     {
-                        // A transição sempre parte da última cor sólida. Se um
-                        // efeito estava rodando, o que está na fita é o frame
-                        // do efeito, então há um salto antes do fade.
-                        fade_from = solid;
-                        fade_to = msg.color;
+                        // A transição sempre parte do último padrão estático.
+                        // Se um efeito estava rodando, o que está na fita é o
+                        // frame do efeito, então há um salto antes do fade.
+                        fade_from = current;
+                        current = msg.pattern;
                         fade_ms = msg.fade_ms;
                         fade_start_us = esp_timer_get_time();
                         next_frame_us = fade_start_us;
@@ -424,11 +736,19 @@ static void led_task(void *arg)
                 case LED_MSG_EFFECT:
                     active = msg.effect;
                     base = msg.color;
+                    params = msg.params;
                     fading = false;
+                    if (active == LED_EFFECT_FIRE && led_state.heat)
+                    {
+                        // Chama sempre começa fria, não de onde parou.
+                        strip_lock();
+                        memset(led_state.heat, 0, (size_t)led_state.count);
+                        strip_unlock();
+                    }
                     next_frame_us = esp_timer_get_time();
                     if (active == LED_EFFECT_NONE)
                     {
-                        led_apply_color(&solid); // restaura cor sólida
+                        apply_pattern(NULL, &current, 0, 0); // restaura o padrão
                     }
                     break;
             }
@@ -444,13 +764,11 @@ static void led_task(void *arg)
             if (elapsed >= fade_ms)
             {
                 fading = false;
-                solid = fade_to;
-                led_apply_color(&solid);
+                apply_pattern(NULL, &current, 0, 0);
             }
             else
             {
-                led_color_t step = color_lerp(fade_from, fade_to, elapsed, fade_ms);
-                led_apply_color(&step);
+                apply_pattern(&fade_from, &current, elapsed, fade_ms);
                 next_frame_us += (int64_t)led_state.frame_ms * 1000;
                 if (next_frame_us < now)
                 {
@@ -460,7 +778,7 @@ static void led_task(void *arg)
         }
         else if (active != LED_EFFECT_NONE)
         {
-            effect_render(active, &base);
+            effect_render(active, &base, &params);
 
             next_frame_us += (int64_t)led_state.frame_ms * 1000;
             if (next_frame_us < now)
@@ -472,13 +790,12 @@ static void led_task(void *arg)
         else if (save_pending)
         {
             save_pending = false;
-            if (!saved_valid || !color_equals(&saved_color, &solid))
+            if (!saved_valid || memcmp(&saved, &current, sizeof(current)) != 0)
             {
-                nvs_save_color(&solid);
-                saved_color = solid;
+                nvs_save_pattern(&current);
+                saved = current;
                 saved_valid = true;
-                ESP_LOGI(TAG, "Color persisted to NVS (r=%u g=%u b=%u w=%u)",
-                         solid.red, solid.green, solid.blue, solid.white);
+                ESP_LOGI(TAG, "Pattern persisted to NVS (type=%d)", (int)current.type);
             }
         }
     }
@@ -486,6 +803,9 @@ static void led_task(void *arg)
 
 bool led_controller_start(void)
 {
+    build_sin_table();
+    rng_state = esp_random() | 1u; // xorshift nao pode partir de zero
+
     if (led_state.strip_mutex == NULL)
     {
         led_state.strip_mutex = xSemaphoreCreateMutex();
@@ -551,6 +871,13 @@ static bool configure_internal(int led_pin, int led_count, led_strip_type_t led_
         led_strip_del(led_state.strip);
         led_state.strip = NULL;
         led_state.config_ready = false;
+    }
+
+    free(led_state.heat);
+    led_state.heat = calloc((size_t)led_count, sizeof(uint8_t));
+    if (led_state.heat == NULL)
+    {
+        ESP_LOGW(TAG, "No heap for fire heat map (%d bytes); fire effect disabled", led_count);
     }
 
     led_strip_config_t strip_config = {
@@ -632,10 +959,10 @@ bool led_controller_restore(void)
     esp_err_t count_err = nvs_get_i32(h, NVS_KEY_COUNT, &count);
     nvs_get_u8(h, NVS_KEY_TYPE, &type);
 
-    led_color_t color = {0};
-    size_t color_len = sizeof(color);
-    bool has_color = (nvs_get_blob(h, NVS_KEY_COLOR, &color, &color_len) == ESP_OK &&
-                      color_len == sizeof(color));
+    static led_pattern_t pattern;
+    size_t pattern_len = sizeof(pattern);
+    bool has_pattern = (nvs_get_blob(h, NVS_KEY_PATTERN, &pattern, &pattern_len) == ESP_OK &&
+                        pattern_len == sizeof(pattern));
     nvs_close(h);
 
     if (pin_err != ESP_OK || count_err != ESP_OK || pin < 0 || count <= 0)
@@ -654,15 +981,15 @@ bool led_controller_restore(void)
         return false;
     }
 
-    if (has_color)
+    if (has_pattern)
     {
-        led_controller_enqueue(&color, 100);
+        led_controller_set_pattern(&pattern, 0, 100);
     }
 
-    ESP_LOGI(TAG, "Restored from NVS: pin=%d count=%d type=%s color=%s",
+    ESP_LOGI(TAG, "Restored from NVS: pin=%d count=%d type=%s pattern=%s",
              (int)pin, (int)count,
              (type == LED_STRIP_TYPE_SK6812) ? "sk6812" : "ws2812b",
-             has_color ? "yes" : "no");
+             has_pattern ? "yes" : "no");
     return true;
 }
 
@@ -673,15 +1000,26 @@ bool led_controller_enqueue(const led_color_t *color, int timeout_ms)
 
 bool led_controller_enqueue_fade(const led_color_t *color, uint16_t fade_ms, int timeout_ms)
 {
-    if (led_state.queue == NULL || color == NULL)
+    if (color == NULL) return false;
+
+    led_pattern_t pattern;
+    pattern_make_solid(&pattern, color);
+    return led_controller_set_pattern(&pattern, fade_ms, timeout_ms);
+}
+
+bool led_controller_set_pattern(const led_pattern_t *pattern, uint16_t fade_ms, int timeout_ms)
+{
+    if (led_state.queue == NULL || pattern == NULL)
     {
         return false;
     }
 
     led_msg_t msg = {
-        .type = LED_MSG_COLOR,
-        .color = *color,
+        .type = LED_MSG_PATTERN,
+        .pattern = *pattern,
+        .color = {0},
         .effect = LED_EFFECT_NONE,
+        .params = { LED_PARAM_DEFAULT, LED_PARAM_DEFAULT },
         .fade_ms = fade_ms
     };
     if (xQueueSend(led_state.queue, &msg, pdMS_TO_TICKS(timeout_ms)) != pdTRUE)
@@ -692,7 +1030,10 @@ bool led_controller_enqueue_fade(const led_color_t *color, uint16_t fade_ms, int
     return true;
 }
 
-bool led_controller_set_effect(led_effect_t effect, const led_color_t *base_color, int timeout_ms)
+bool led_controller_set_effect(led_effect_t effect,
+                               const led_color_t *base_color,
+                               const led_effect_params_t *params,
+                               int timeout_ms)
 {
     if (led_state.queue == NULL)
     {
@@ -701,13 +1042,19 @@ bool led_controller_set_effect(led_effect_t effect, const led_color_t *base_colo
 
     led_msg_t msg = {
         .type = LED_MSG_EFFECT,
+        .pattern = {0},
         .color = {255, 255, 255, 0},
         .effect = effect,
+        .params = { LED_PARAM_DEFAULT, LED_PARAM_DEFAULT },
         .fade_ms = 0
     };
     if (base_color != NULL)
     {
         msg.color = *base_color;
+    }
+    if (params != NULL)
+    {
+        msg.params = *params;
     }
 
     if (xQueueSend(led_state.queue, &msg, pdMS_TO_TICKS(timeout_ms)) != pdTRUE)

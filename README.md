@@ -27,7 +27,12 @@ Este projeto permite controlar dispositivos remotamente via Wake-on-LAN e també
 - ✅ Wake-on-LAN via pacote mágico UDP
 - ✅ Controle de cor RGB global para fita LED WS2812B (`r`, `g`, `b`)
 - ✅ Suporte a fita SK6812 RGBW com controle do canal branco (`w`)
-- ✅ Efeitos animados rodando no próprio firmware (`breathing`, `rainbow`, `fade`) — renderizados de forma não-bloqueante na tarefa de LED, sem depender de fluxo contínuo do servidor
+- ✅ Padrões estáticos: gradiente por stops e trechos com cores próprias, guardados como descrição (não como buffer de pixels)
+- ✅ Transição suave entre cores (`fadeMs`), interpolada na tarefa de LED
+- ✅ Configuração e última cor persistidas em NVS — a fita acende no boot sem esperar WiFi + TLS + `get_config`
+- ✅ Correção de gamma 2.2 por LUT — compensa a resposta logarítmica do olho, então o `breathing` varia de forma perceptualmente linear
+- ✅ Animação baseada em relógio (`esp_timer`) com orçamento de frame derivado do tamanho da fita — a mesma animação roda na mesma velocidade em fitas de 90 e de 589 LEDs
+- ✅ Oito efeitos animados rodando no próprio firmware, com velocidade e intensidade ajustáveis — renderizados de forma não-bloqueante na tarefa de LED, sem depender de fluxo contínuo do servidor
 - ✅ Reassembly de payload WebSocket fragmentado
 - ✅ Tratamento de JSON inválido, `ping/pong` e respostas de erro padronizadas
 
@@ -175,9 +180,13 @@ Formato RGB (WS2812B ou SK6812 RGB):
     "action": "led",
     "r": 0,
     "g": 255,
-    "b": 128
+    "b": 128,
+    "fadeMs": 600
 }
 ```
+`fadeMs` é opcional (0-60000): com valor maior que zero o firmware interpola da cor sólida atual até a nova ao longo desse tempo, no ritmo do orçamento de frame. Ausente ou `0` aplica na hora.
+
+> A transição parte sempre da última cor **sólida**. Se um efeito estiver rodando, o que está na fita é o frame do efeito, então há um salto antes do fade começar.
 
 Formato RGBW (apenas para SK6812 RGBW):
 ```json
@@ -191,19 +200,69 @@ Formato RGBW (apenas para SK6812 RGBW):
 ```
 O campo `w` (white) é opcional e só tem efeito se a fita for SK6812 RGBW.
 
+#### 4a. Padrões estáticos (Servidor → ESP32)
+
+Gradiente — o firmware interpola entre os stops ao longo da fita:
+```json
+{
+    "action": "gradient",
+    "stops": [
+        { "pos": 0,   "r": 255, "g": 80, "b": 0 },
+        { "pos": 255, "r": 0,   "g": 40, "b": 255 }
+    ],
+    "fadeMs": 800
+}
+```
+- `stops`: 2 a 8 itens, `pos` de `0` a `255` **em ordem crescente** (a busca por pixel assume isso), `w` opcional
+- erros: `invalid_stops`, `stops_out_of_order`, `need_two_stops`
+
+Trechos com cores próprias:
+```json
+{
+    "action": "segments",
+    "segments": [
+        { "from": 0,   "to": 199, "r": 255, "g": 0, "b": 0 },
+        { "from": 200, "to": 588, "r": 0,   "g": 0, "b": 255 }
+    ]
+}
+```
+- `segments`: 1 a 8 trechos, índices inclusivos; pixel fora de todos fica apagado
+- erros: `invalid_segments`, `need_one_segment`
+
+Os dois aceitam `fadeMs` e interrompem qualquer efeito ativo. O padrão é guardado como **descrição** (stops/trechos), não como buffer de pixels — numa fita de 589 LEDs isso é a diferença entre ~120 bytes e ~2,3 KB, e o crossfade só precisa avaliar os dois padrões por pixel.
+
+O `config` pode trazer `lastPattern` no mesmo formato (`{"type":"solid|gradient|segments", ...}`). Quando vem, tem prioridade sobre `lastLedColor` — senão reconectar jogaria uma cor sólida por cima do gradiente que a NVS acabou de restaurar.
+
 #### 4b. Comando de Efeito (Servidor → ESP32)
 Ativa uma animação que roda **no próprio firmware** (o servidor envia apenas um comando):
 ```json
 {
     "action": "effect",
-    "effect": "breathing",
+    "effect": "fire",
     "r": 255,
     "g": 100,
-    "b": 50
+    "b": 50,
+    "speed": 70,
+    "intensity": 80
 }
 ```
-- `effect`: `breathing`, `rainbow`, `fade` ou `none` (para interromper e voltar à última cor sólida)
-- `r`/`g`/`b`: cor base opcional, usada por efeitos como `breathing`
+- `effect`: um dos nomes da tabela abaixo, ou `none` (para interromper e voltar à última cor sólida). Nome desconhecido responde `unknown_effect` — antes era tratado como `none` com status `ok`, então um typo virava "parou sem erro nenhum"
+- `r`/`g`/`b`: cor base opcional
+- `speed`: `0-100`, escala o período da animação (50 = padrão, 0 = 4x mais lento, 100 = 4x mais rápido)
+- `intensity`: `0-100`, significado por efeito
+
+| Efeito | Descrição | Usa a cor base | Intensidade controla |
+|---|---|---|---|
+| `breathing` | Pulsa o brilho suavemente | sim | profundidade do pulso |
+| `rainbow` | Espectro percorrendo a fita | não | — |
+| `fade` | Fita inteira trocando de matiz | não | — |
+| `fire` | Chama subindo, paleta própria | não | altura da chama |
+| `comet` | Cabeça com cauda deslizando | sim | tamanho da cauda |
+| `twinkle` | Pontos piscando ao acaso | sim | densidade de estrelas |
+| `wave` | Duas senoides somadas | sim | número de cristas |
+| `wipe` | Preenche a fita e recomeça | sim | suavidade da borda |
+
+Só o `fire` guarda estado entre frames: um mapa de calor de 1 byte por LED, alocado junto com a fita (589 bytes na fita da sala). Os demais derivam tudo da fase e de hashes, sem buffer.
 - A animação é renderizada de forma não-bloqueante na tarefa de LED; receber um comando `led` (cor sólida) também interrompe o efeito
 
 #### 5. Confirmação (ESP32 → Servidor)
@@ -368,7 +427,11 @@ idf.py monitor
 - `WebSocket Connected!` - Conexão WebSocket estabelecida
 - `Auth sent (mac=... token=...)` - Autenticação enviada ao servidor
 - `Requested server config with get_config` - Solicitação de configuração dinâmica
+- `Restored from NVS: pin=... count=... type=... color=yes` - estado recuperado antes da rede
+- `LED config unchanged (pin=... count=...) - keeping strip alive` - reconexão sem recriar a fita
+- `Color persisted to NVS (r=... g=... b=... w=...)` - cor gravada após 5 s parada
 - `Server config applied successfully (ledCount=... ledPin=...)` - LED configurado via servidor
+- `LED strip configured: pin=... count=... type=... frame=...ms (~N fps)` - orçamento de frame calculado a partir do tamanho da fita
 - `Command received: ...` - Mensagem JSON recebida do servidor
 - `Wake-on-LAN packet sent (102 bytes)` - Pacote WoL enviado
 - `WebSocket Disconnected` - Reconectando automaticamente com backoff
@@ -419,7 +482,7 @@ esp32-wol-client/
 │   │   └── net_utils.c     # WiFi, SNTP, HMAC, MAC, WoL
 │   ├── led/
 │   │   ├── led_controller.h
-│   │   └── led_controller.c # Queue/tarefa de LED, aplicação de cor e efeitos (breathing/rainbow/fade)
+│   │   └── led_controller.c # Queue/tarefa de LED, funil de saída (gamma), padrões, transições, efeitos e NVS
 │   ├── ws/
 │   │   ├── ws_client.h
 │   │   ├── ws_client.c      # Fachada WS
@@ -428,7 +491,7 @@ esp32-wol-client/
 │   │   ├── ws_protocol.h
 │   │   ├── ws_protocol.c
 │   │   ├── ws_protocol_auth.c
-│   │   ├── ws_protocol_commands.c # Dispatch de comandos: wol, led, effect, config, ping
+│   │   ├── ws_protocol_commands.c # Dispatch: wol, led, gradient, segments, effect, config, ping
 │   │   ├── ws_protocol_internal.h
 │   │   ├── ws_frame_reassembly.h
 │   │   └── ws_frame_reassembly.c # Reassembly de frames fragmentados

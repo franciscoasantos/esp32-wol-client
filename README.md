@@ -108,20 +108,24 @@ pelo bootloader antes de qualquer código da aplicação, então trocá-la é a 
 coisa que não dá para fazer por OTA** — daí a necessidade de uma última gravação
 por cabo em cada dispositivo.
 
-Se o ESP ainda estiver com o layout antigo (`partitions_singleapp`), a migração
-exige apagar a flash, porque os offsets mudam:
+Se o ESP ainda estiver com o layout antigo (`partitions_singleapp`):
 
 ```bash
 idf.py fullclean
 idf.py build
-idf.py -p COM3 erase-flash
 idf.py -p COM3 flash monitor
 ```
 
-O `erase-flash` apaga a NVS junto, então a fita perde a configuração salva
-(`pin`/`count`/`type`/`pattern`). Isso se resolve sozinho: o servidor reenvia
-tudo no `get_config` logo após o handshake — a fita só demora alguns segundos a
-mais para acender nesse primeiro boot.
+A partição `nvs` encolhe de 24K para 16K na migração, e os dados antigos ficam
+para trás — o que faz o `nvs_flash_init()` falhar com
+`ESP_ERR_NVS_NO_FREE_PAGES`. O firmware trata isso sozinho: detecta o erro,
+apaga a NVS e reinicializa. A fita perde a configuração salva
+(`pin`/`count`/`type`/`pattern`), mas o servidor reenvia tudo no `get_config`
+logo após o handshake — só demora alguns segundos a mais para acender nesse
+primeiro boot.
+
+Um `idf.py -p COM3 erase-flash` antes do `flash` também resolve, e deixa a flash
+num estado limpo, mas não é necessário.
 
 > **Antes de gravar, confira o tamanho real da flash:**
 >

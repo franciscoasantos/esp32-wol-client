@@ -2,6 +2,7 @@
 #include "esp_log.h"
 #include "net_utils.h"
 #include "led_controller.h"
+#include "ota_manager.h"
 #include "ws_client.h"
 
 static const char *TAG = "ESP_WOL_MAIN";
@@ -14,6 +15,11 @@ void app_main()
         ESP_LOGE(TAG, "nvs_flash_init failed: %s", esp_err_to_name(err));
         return;
     }
+
+    // Antes de qualquer coisa que possa falhar: se esta imagem veio de um OTA e
+    // ainda não foi confirmada, arma o rollback automático. Quem confirma é o
+    // handler de `config`, ao provar que o servidor respondeu.
+    ota_manager_boot_check();
 
     // LED antes da rede: com a configuração e a cor na NVS a fita acende em
     // ~200 ms em vez de ficar apagada durante WiFi + SNTP + TLS + get_config.

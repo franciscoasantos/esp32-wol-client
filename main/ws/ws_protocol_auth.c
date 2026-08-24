@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <time.h>
 
+#include "esp_app_desc.h"
 #include "esp_log.h"
 
 #include "net_utils.h"
@@ -19,11 +20,17 @@ void ws_protocol_on_connected(esp_websocket_client_handle_t client, const char *
 
     const char *mac = device_mac ? device_mac : "00:00:00:00:00:00";
 
-    char auth[320];
-    snprintf(auth, sizeof(auth), "{\"token\":\"%s\",\"hmac\":\"%s\",\"mac\":\"%s\"}", token, hmac, mac);
+    // A versão viaja no handshake para o servidor saber o que cada ESP está
+    // rodando e decidir se oferece update. Servidores antigos ignoram o campo.
+    const char *version = esp_app_get_description()->version;
+
+    char auth[384];
+    snprintf(auth, sizeof(auth),
+             "{\"token\":\"%s\",\"hmac\":\"%s\",\"mac\":\"%s\",\"version\":\"%s\"}",
+             token, hmac, mac, version);
 
     ws_protocol_send_json(client, auth);
-    ESP_LOGI(TAG, "Auth sent (mac=%s token=%s)", mac, token);
+    ESP_LOGI(TAG, "Auth sent (mac=%s token=%s version=%s)", mac, token, version);
 
     ws_protocol_send_json(client, "{\"action\":\"get_config\"}");
     ESP_LOGI(TAG, "Requested server config with get_config");

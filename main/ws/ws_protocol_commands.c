@@ -5,6 +5,7 @@
 
 #include "net_utils.h"
 #include "led_controller.h"
+#include "ota_manager.h"
 #include "ws_protocol.h"
 #include "ws_protocol_internal.h"
 
@@ -394,6 +395,39 @@ static bool handle_effect_command(cJSON *root, esp_websocket_client_handle_t cli
     return true;
 }
 
+static bool handle_ota_command(cJSON *root, esp_websocket_client_handle_t client)
+{
+    cJSON *url_json = cJSON_GetObjectItemCaseSensitive(root, "url");
+    if (!cJSON_IsString(url_json) || url_json->valuestring == NULL)
+    {
+        ws_protocol_send_error(client, "ota", "missing url");
+        return false;
+    }
+
+    cJSON *version_json = cJSON_GetObjectItemCaseSensitive(root, "version");
+    const char *version = (cJSON_IsString(version_json) && version_json->valuestring)
+                              ? version_json->valuestring
+                              : NULL;
+
+    cJSON *force_json = cJSON_GetObjectItemCaseSensitive(root, "force");
+    const bool force = cJSON_IsTrue(force_json);
+
+    // Só valida e delega: este handler roda na task do esp_websocket_client, e
+    // baixar ~1 MB aqui dentro travaria a conexão e estouraria o stack dela.
+    const char *err = NULL;
+    if (!ota_manager_start(url_json->valuestring, version, force, client, &err))
+    {
+        ESP_LOGW(TAG, "Refused OTA request: %s", err ? err : "unknown");
+        ws_protocol_send_error(client, "ota", err ? err : "unknown");
+        return false;
+    }
+
+    // ACK imediato: confirma o aceite do comando, não o fim do flash. O
+    // progresso vem depois em ota_progress/ota_result.
+    ws_protocol_send_json(client, "{\"status\":\"ok\",\"action\":\"ota\",\"state\":\"started\"}");
+    return true;
+}
+
 static bool handle_config_message(cJSON *root, esp_websocket_client_handle_t client)
 {
     cJSON *status_json = cJSON_GetObjectItemCaseSensitive(root, "status");
@@ -492,6 +526,11 @@ static bool handle_config_message(cJSON *root, esp_websocket_client_handle_t cli
                  current_color.red, current_color.green, current_color.blue, current_color.white);
         ws_protocol_send_json(client, state_report);
 
+        // O servidor respondeu e a config foi aplicada: WiFi, SNTP, TLS, HMAC e
+        // servidor estão todos comprovadamente de pé. É o ponto certo para
+        // confirmar uma imagem recém-instalada e cancelar o rollback armado.
+        ota_manager_confirm_running_image();
+
         return true;
     }
 
@@ -579,6 +618,10 @@ void ws_protocol_handle_complete_text(esp_websocket_client_handle_t client, cons
     else if (strcmp(action, "ping") == 0)
     {
         ws_protocol_send_json(client, "{\"status\":\"ok\",\"action\":\"pong\"}");
+    }
+    else if (strcmp(action, "ota") == 0)
+    {
+        handle_ota_command(root, client);
     }
     else if (strcmp(action, "config") == 0)
     {

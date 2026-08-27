@@ -37,6 +37,6 @@ direct_dependencies:
 - espressif/cjson
 - espressif/esp_websocket_client
 - espressif/led_strip
-manifest_hash: 4b3adf186c591fddaf2cdd9452efde841b28d47d40515fec46a77ba8cf20a295
+manifest_hash: 7a8c5524700ccd7632d4a99b43270ef08c6a1f6cd8f6d183711a089166aae8ae
 target: esp32
 version: 3.0.0

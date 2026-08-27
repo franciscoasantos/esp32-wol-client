@@ -19,10 +19,16 @@
 
 static const char *TAG = "ESP_WOL_OTA";
 
-// Janela de auto-teste da imagem recém-instalada. Generosa de propósito: o
-// caminho feliz é WiFi + SNTP (até 10 s) + TLS + backoff de reconexão de até
-// 30 s, e confirmar cedo demais anularia a rede de segurança.
-#define OTA_SELF_TEST_TIMEOUT_US (5ULL * 60ULL * 1000000ULL)
+// Janela de auto-teste da imagem recém-instalada, dimensionada a partir de
+// medições reais: boot → WiFi → SNTP → TLS → get_config leva ~11 s nos dois
+// dispositivos. O pior caso legítimo é ~75 s, quando o WebSocket precisa de
+// todo o backoff (2+4+8+16+30 s) antes de uma conexão que ainda daria certo.
+// 120 s cobre isso com margem de 1,6× sem esticar a recuperação à toa.
+//
+// Encurtar mais arriscaria reverter um firmware bom que só demorou; alongar só
+// aumenta o tempo sem controle remoto, já que a fita continua acesa (restaurada
+// da NVS) durante toda a janela.
+#define OTA_SELF_TEST_TIMEOUT_US (120ULL * 1000000ULL)
 
 // Progresso a cada 5%: cada envio é um frame no mesmo WebSocket que carrega
 // todo o resto, e a fita já disputa CPU com o download.

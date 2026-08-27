@@ -33,7 +33,7 @@ Este projeto permite controlar dispositivos remotamente via Wake-on-LAN e també
 - ✅ Correção de gamma 2.2 por LUT — compensa a resposta logarítmica do olho, então o `breathing` varia de forma perceptualmente linear
 - ✅ Animação baseada em relógio (`esp_timer`) com orçamento de frame derivado do tamanho da fita — a mesma animação roda na mesma velocidade em fitas de 90 e de 589 LEDs
 - ✅ Oito efeitos animados rodando no próprio firmware, com velocidade e intensidade ajustáveis — renderizados de forma não-bloqueante na tarefa de LED, sem depender de fluxo contínuo do servidor
-- ✅ Atualização de firmware pelo ar (OTA) via `esp_https_ota`, com progresso reportado ao servidor e **rollback automático** caso a imagem nova não consiga falar com o servidor em 5 minutos
+- ✅ Atualização de firmware pelo ar (OTA) via `esp_https_ota`, com progresso reportado ao servidor e **rollback automático** caso a imagem nova não consiga falar com o servidor em 2 minutos
 - ✅ Reassembly de payload WebSocket fragmentado
 - ✅ Tratamento de JSON inválido, `ping/pong` e respostas de erro padronizadas
 
@@ -359,7 +359,7 @@ Recusas possíveis (`{"status":"error","action":"ota","message":"..."}`):
 
 A imagem instalada dá boot em estado `PENDING_VERIFY` e **só vira definitiva
 depois de o servidor responder ao `get_config`** — a prova de que WiFi, SNTP,
-TLS, HMAC e servidor estão todos de pé. Se essa confirmação não vier em 5
+TLS, HMAC e servidor estão todos de pé. Se essa confirmação não vier em 2
 minutos, o firmware chama `esp_ota_mark_app_invalid_rollback_and_reboot()` e o
 dispositivo volta para a imagem anterior sozinho.
 
@@ -528,7 +528,7 @@ ifconfig
   `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN`/`OUT_CONTENT_LEN` de 16384 para 4096
   economiza ~24 KB por sessão
 - Dispositivo voltou para a versão anterior sozinho: é o rollback funcionando. A
-  imagem nova subiu mas não conseguiu completar o `get_config` em 5 minutos —
+  imagem nova subiu mas não conseguiu completar o `get_config` em 2 minutos —
   veja o `idf.py monitor` ou os logs do servidor para o motivo real
 
 ### ESP32 não recebe mensagens do servidor

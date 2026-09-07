@@ -321,7 +321,7 @@ Só o `fire` guarda estado entre frames: um mapa de calor de 1 byte por LED, alo
 ```json
 {
     "action": "ota",
-    "url": "https://wol.exemplo.net/firmware/latest.bin?token=esp32-...&hmac=...",
+    "url": "https://espnest.exemplo.net/firmware/latest.bin?token=esp32-...&hmac=...",
     "version": "v1.1.0",
     "size": 962928,
     "sha256": "b95cea..."

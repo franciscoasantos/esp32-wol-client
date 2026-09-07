@@ -1,4 +1,4 @@
-# ESP32 WoL Client - Wake-on-LAN + LED Strip via WebSocket
+# EspNest Client — Wake-on-LAN + LED Strip via WebSocket
 
 Sistema de controle remoto de Wake-on-LAN e fita LED RGB (WS2812B) ou RGBW (SK6812) baseado em ESP32 com conexão WebSocket para acesso através de servidor VPS.
 
@@ -49,7 +49,7 @@ Este projeto permite controlar dispositivos remotamente via Wake-on-LAN e també
 
 ```bash
 git clone <url-do-repositorio>
-cd esp32-wol-client
+cd espnest-client
 ```
 
 ### 2. Configurar o Projeto
@@ -410,7 +410,7 @@ O sistema utiliza autenticação baseada em HMAC-SHA256 com timestamp para garan
 ## 📝 Estrutura do Projeto
 
 ```
-esp32-wol-client/
+espnest-client/
 ├── main/
 │   ├── main.c              # Bootstrap da aplicação
 │   ├── config.h            # Configurações estáticas (WiFi, WS_URI, SECRET)

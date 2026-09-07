@@ -2,3 +2,19 @@
 # Root CA, que nao esta mais no bundle de CAs do IDF. Sem isto o handshake wss://
 # falha com "No matching trusted root certificate found".
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+
+# OTA exige duas particoes de app. O layout vive em partitions.csv; ate aqui
+# flash size e tabela de particoes moravam so no sdkconfig, que nao e
+# versionado — deixando o build nao-reproduzivel.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Habilita esp_ota_mark_app_valid_cancel_rollback(): a imagem nova da boot em
+# PENDING_VERIFY e so vira definitiva depois de provar que fala com o servidor.
+# Sem isto, um firmware que da boot mas nao conecta so sai com cabo.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# -Os no lugar do -Og: o binario ja ocupava 971 KiB e o stack de OTA
+# (esp_https_ota + esp_http_client + app_update) soma ~30 KB.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
